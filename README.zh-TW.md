@@ -10,7 +10,7 @@
 
 | 指令 | 作用 |
 | --- | --- |
-| `zju login` | 設定學號，密碼存進系統憑證庫（macOS Keychain / Windows 憑證管理員 / Linux Secret Service） |
+| `zju login` | 設定學號，密碼存進系統憑證庫（macOS Keychain；其他系統走 [keyring](https://pypi.org/project/keyring/)） |
 | `zju courses [--all]` | 課程列表（預設只列最新學年） |
 | `zju sync [課程...]` | 增量同步課件到 `<輸出目錄>/<課程>/` |
 | `zju todo` | 待辦事項，依截止時間排序（本地時區） |
@@ -37,7 +37,7 @@ zju login
 ```bash
 zju sync --dry-run                 # 先看會下載什麼、總共多大
 zju sync                           # 最新學年全部課程
-zju sync 计算机组成 102170          # 指定課程（名稱片段或 id）
+zju sync 微积分 123456              # 指定課程（名稱片段或 id，id 用 zju courses 查）
 zju sync --videos --max-size 0     # 連影音和大檔一起抓
 zju sync -j 8                      # 並行數（預設 4）
 
@@ -59,18 +59,19 @@ zju transcript --days 1 --format md
 ## 跟 ZLA 的差異
 
 - **增量同步**：以 `.zju_manifest.json` 記錄 upload id，而不是比對檔名和大小；老師換了新版（新 id）才會重抓。
-- **下載不留殘檔**：先寫 `.part-*`，完成後再 rename。
-- **並行下載**：課件預設 4 檔同時，PPT 截圖 8 張同時；每條執行緒有自己的 session，共用 cookie jar。
-- **預設直連**，連不上才改走系統 proxy；連線 timeout 6 秒，排程時不會卡死。
+- **下載完整性**：先寫 `.part-*`，核對 `Content-Length` 後才 rename；空檔、截斷、伺服器回的 HTML 錯誤頁都不會被記成已下載。
+- **並行下載**：課件預設 4 檔同時，PPT 截圖 8 張同時；每條執行緒有自己的 session，共用 cookie jar。遇到 429/503 會照 `Retry-After` 退讓。
+- **預設直連**，連不上才改走系統 proxy；連線 timeout 6 秒，排程時不會卡死。只有冪等請求會自動重試，登入 POST 不會被重送。
 - **學年判斷**：學校常常不把舊課程標成已結束（`is_closed`），因此改用 `academic_year_id` 找最新學年。
-- **同名課程**（不同教學班）分開存放，避免同名檔互相覆蓋。
+- **同名課程**（不同教學班）分開存放；同一課程裡的同名檔一律加上 id，命名不受 API 回傳順序影響。
 - 預設跳過影音檔和 200MB 以上的檔案（通常是軟體安裝包、專題壓縮檔），`--dry-run` 會列出總大小。
 
 修掉的上游邊界狀況：
 
 - 智雲 `search-ppt` 不遵守 `per_page`：常常第 1 頁就回傳全部，下一頁再重複一次。ZLA 假設每頁最多 100 張，超過 100 頁的課會一直重試然後失敗；這裡改成依序去重。
 - 轉錄 API 對「還沒有語音資料」回傳 `code=10002`，現在當成「無轉錄」處理，不再中止整批。
-- SSO 跳轉鏈上有主機使用 1024-bit DH，OpenSSL 3 預設會拒絕連線（`DH_KEY_TOO_SMALL`）；這個 session 改用 `SECLEVEL=1`。
+- **明文傳送登入憑證**：智雲 PPT 截圖網址是 `http://`，而 `.zju.edu.cn` 的 SSO cookie（包括 `iPlanetDirectoryPro`）沒有設 `Secure`，照常下載就會把登入憑證用明文送出。這裡把學校主機的網址升級成 HTTPS，而且所有 `http://` 請求都不帶 Cookie 和 Authorization。
+- `courses.zju.edu.cn` 與 `identity.zju.edu.cn` 只支援 1024-bit DHE／靜態 RSA，OpenSSL 3 預設拒絕連線（`DH_KEY_TOO_SMALL`）。`SECLEVEL=1` 只套用在這兩台，其他主機維持預設的 TLS 設定。
 - 智雲的 `_token` cookie 設在 `.zju.edu.cn` 父網域，而不是 `classroom.zju.edu.cn`。
 
 ## 關閉下載的課件
@@ -85,11 +86,15 @@ zju transcript --days 1 --format md
 
 ## 安全性
 
-- macOS 的密碼透過系統 `security` 在終端機提示輸入並存入 Keychain，不會出現在命令列參數或 shell 歷史紀錄。也可以改用環境變數 `ZJU_USER` / `ZJU_PASS`。
-- Session cookie 快取在 `~/.config/zju-learning/cookies.pkl`，權限 `0600`；過期時自動用憑證庫的密碼重新登入。
-- 只連學校的服務（包括下載時可能跳轉到的學校檔案儲存主機），不經過任何第三方伺服器。
+- 密碼只存在系統憑證庫。macOS 由系統 `security` 在終端機提示輸入，不會出現在命令列參數或 shell 歷史紀錄。也可以改用環境變數 `ZJU_USER` / `ZJU_PASS`。
+- 登入時密碼先用 CAS 提供的公鑰加密再送出，跟網頁登入的做法相同。
+- Session cookie 以 JSON（不是 pickle）快取在 `~/.config/zju-learning/cookies.json`；在 macOS／Linux 上檔案權限是 `0600`，目錄是 `0700`。
+- Cookie 只會透過 HTTPS 送往 `*.zju.edu.cn`，明文 `http://` 請求一律不帶。沒有任何遙測。
+- TLS 驗證失敗會直接報錯，不會自動重試或改走 proxy，避免把中間人攻擊誤當成網路不穩。
 
 ## 免責聲明
+
+只在 macOS 上實測過；Linux、Windows 理論上可以使用，但沒有測試過（Windows 請用 `python zju.py`）。
 
 僅供個人學習使用。課件的著作權屬於授課教師與學校，請勿散布下載的內容；使用時請遵守學校的相關規定，不要高頻或大量抓取。學校的 API 沒有公開文件，隨時可能改版。
 

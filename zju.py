@@ -27,7 +27,6 @@ import argparse
 import datetime as dt
 import json
 import os
-import pickle
 import random
 import re
 import shutil
@@ -38,7 +37,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import ssl
 
@@ -48,7 +47,10 @@ from requests.adapters import HTTPAdapter
 KEYCHAIN_SERVICE = "zju-learning"
 STATE_DIR = Path.home() / ".config" / "zju-learning"
 CONFIG_FILE = STATE_DIR / "config.json"
-COOKIE_FILE = STATE_DIR / "cookies.pkl"
+COOKIE_FILE = STATE_DIR / "cookies.json"
+# 這兩台只支援 1024-bit DHE / 靜態 RSA，OpenSSL 3 預設拒絕；降級只套用在它們身上
+LEGACY_TLS_HOSTS = ("courses.zju.edu.cn", "identity.zju.edu.cn")
+CST = dt.timezone(dt.timedelta(hours=8))  # 學校 API 沒帶時區時視為北京時間
 DEFAULT_OUT = Path.home() / "ZJU-Courses"  # 可用 config.json 的 "out" 或環境變數 ZJU_OUT 覆寫
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:88.0) Gecko/20100101 Firefox/88.0"
 MEDIA_EXT = {".mp4", ".mov", ".avi", ".mkv", ".flv", ".m4v", ".wmv", ".webm", ".mp3", ".m4a", ".wav"}
@@ -68,21 +70,36 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+WIN_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
 def safe_name(s: str) -> str:
-    s = re.sub(r'[/\\:*?"<>|\n\r\t]', "_", str(s)).strip().strip(".")
-    return s[:150] or "_"
+    s = re.sub(r'[/\\:*?"<>|\x00-\x1f]', "_", str(s)).strip(" .")
+    s = s[:150].rstrip(" .") or "_"
+    if s.split(".")[0].upper() in WIN_RESERVED:  # Windows 保留裝置名
+        s = "_" + s
+    return s
 
 
 # ---------------- config / credentials ----------------
 
+def state_dir() -> Path:
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(STATE_DIR, 0o700)
+    return STATE_DIR
+
+
 def load_config() -> dict:
-    if CONFIG_FILE.exists():
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
         return json.loads(CONFIG_FILE.read_text())
-    return {}
+    except ValueError as e:
+        raise ZjuError(f"{CONFIG_FILE} 格式錯誤：{e}")
 
 
 def save_config(cfg: dict):
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state_dir()
     CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
 
 
@@ -130,7 +147,7 @@ def get_credentials() -> tuple[str, str]:
 # ---------------- client ----------------
 
 class LegacyTLS(HTTPAdapter):
-    """學在浙大 SSO 跳轉鏈上有主機用 1024-bit DH，OpenSSL 3 預設拒絕（DH_KEY_TOO_SMALL）。"""
+    """只掛在 LEGACY_TLS_HOSTS：它們只給 1024-bit DHE，OpenSSL 3 報 DH_KEY_TOO_SMALL。"""
 
     def init_poolmanager(self, *a, **kw):
         ctx = ssl.create_default_context()
@@ -145,39 +162,93 @@ class LegacyTLS(HTTPAdapter):
         return super().proxy_manager_for(*a, **kw)
 
 
+class NoCookieHTTP(HTTPAdapter):
+    """明文 http:// 一律不帶 cookie / Authorization。
+    .zju.edu.cn 的 SSO cookie（iPlanetDirectoryPro 等）沒設 Secure，瀏覽器和 requests
+    都會照送給 http 網址 —— 智雲 PPT 圖片就是 http，等於把登入憑證明文送出。"""
+
+    def send(self, request, **kw):
+        request.headers.pop("Cookie", None)
+        request.headers.pop("Authorization", None)
+        return super().send(request, **kw)
+
+
+class DownloadError(ZjuError):
+    def __init__(self, msg: str, codes: list[int]):
+        super().__init__(msg)
+        self.codes = codes
+
+
+class TooBig(ZjuError):
+    pass
+
+
+def secure_url(u: str) -> str:
+    """學校主機的 http 網址升級成 https（實測 video.cmc 等都支援）。"""
+    p = urlparse(u)
+    if p.scheme == "http" and (p.hostname or "").endswith(".zju.edu.cn"):
+        return "https" + u[4:]
+    return u
+
+
 class Zju:
     def __init__(self):
         self.jar = requests.cookies.RequestsCookieJar()  # 各執行緒 session 共用（CookieJar 自帶鎖）
         self._tl = threading.local()
         self.logged_in = False
-        if COOKIE_FILE.exists():
-            try:
-                self.jar.update(pickle.loads(COOKIE_FILE.read_bytes()))
-            except Exception:
-                pass
+        self._load_cookies()
+
+    def _load_cookies(self):
+        (STATE_DIR / "cookies.pkl").unlink(missing_ok=True)  # 舊版 pickle 快取：不再讀取
+        if not COOKIE_FILE.exists():
+            return
+        try:
+            for d in json.loads(COOKIE_FILE.read_text()):
+                self.jar.set_cookie(requests.cookies.create_cookie(**d))
+        except (ValueError, TypeError, KeyError):
+            COOKIE_FILE.unlink(missing_ok=True)  # 壞了就重登
 
     @property
     def s(self) -> requests.Session:
         """每個執行緒一個 session：連線池不互搶，trust_env 切換也不會互相干擾。"""
         if not hasattr(self._tl, "s"):
             s = requests.Session()
-            s.mount("https://", LegacyTLS(pool_connections=8, pool_maxsize=8))
+            s.mount("https://", HTTPAdapter(pool_connections=8, pool_maxsize=8))
+            for h in LEGACY_TLS_HOSTS:
+                s.mount(f"https://{h}", LegacyTLS(pool_connections=8, pool_maxsize=8))
+            s.mount("http://", NoCookieHTTP())
             s.headers["User-Agent"] = UA
             s.cookies = self.jar
             self._tl.s = s
         return self._tl.s
 
-    # 預設直連（浙大站走 Clash 只會多一跳），連不上才退環境 proxy
-    def req(self, method: str, url: str, **kw) -> requests.Response:
+    def req(self, method: str, url: str, retry: bool | None = None, **kw) -> requests.Response:
+        """預設直連，連不上才退環境 proxy。
+        重試只給冪等請求（GET 或明確 retry=True）；非冪等只在「確定沒送出」（連線逾時／proxy 錯）時重試，
+        免得登入 POST 被重送、觸發 CAS 驗證碼。TLS 錯誤不重試：跟斷線要分得出來。"""
         kw.setdefault("timeout", TIMEOUT)
+        idempotent = method in ("GET", "HEAD") if retry is None else retry
         last = None
         for attempt in range(4):
             self.s.trust_env = attempt % 2 == 1
             try:
-                return self.s.request(method, url, **kw)
-            except (requests.ConnectionError, requests.Timeout) as e:
+                r = self.s.request(method, url, **kw)
+            except requests.exceptions.SSLError as e:
+                raise ZjuError(f"TLS 驗證失敗（網路可能被攔截，或學校憑證有問題）：{url}\n{e}")
+            except (requests.exceptions.ConnectTimeout, requests.exceptions.ProxyError) as e:
                 last = e
-                time.sleep(0.3 * 2 ** attempt)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if not idempotent:
+                    raise ZjuError(f"連線中斷（請求可能已送出，不自動重送）：{url}\n{e}")
+                last = e
+            else:
+                if r.status_code in (429, 503) and attempt < 3:  # 被限流：照 Retry-After 退讓
+                    wait = r.headers.get("Retry-After", "")
+                    r.close()
+                    time.sleep(min(int(wait), 60) if wait.isdigit() else 2 * 2 ** attempt)
+                    continue
+                return r
+            time.sleep(0.3 * 2 ** attempt)
         raise ZjuError(f"連線失敗：{url}\n{last}")
 
     def get(self, url, **kw):
@@ -187,11 +258,14 @@ class Zju:
         return self.req("POST", url, **kw)
 
     def save_cookies(self):
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        """JSON 不是 pickle：快取檔被別人改了也只是讀到壞 cookie，不會執行程式碼。"""
+        state_dir()
+        data = [{"name": c.name, "value": c.value, "domain": c.domain, "path": c.path,
+                 "secure": c.secure, "expires": c.expires, "rest": c._rest} for c in self.jar]
         tmp = COOKIE_FILE.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as f:
-            pickle.dump(self.jar, f)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
         os.replace(tmp, COOKIE_FILE)
         os.chmod(COOKIE_FILE, 0o600)
 
@@ -238,8 +312,7 @@ class Zju:
 
     def _token(self, silent=False) -> str | None:
         for c in self.s.cookies:
-            dom = (c.domain or "").lstrip(".")
-            if not ("classroom.zju.edu.cn" == dom or "classroom.zju.edu.cn".endswith("." + dom)):
+            if (c.domain or "").lstrip(".") not in ("classroom.zju.edu.cn", "zju.edu.cn"):
                 continue
             m = re.search(r'\{i:\d+;s:\d+:"_token";i:\d+;s:\d+:"(.+?)";\}', unquote(c.value or ""))
             if m:
@@ -263,7 +336,7 @@ class Zju:
         self.ensure()
         out, page = [], 1
         while True:
-            j = self.json(self.post("https://courses.zju.edu.cn/api/my-courses", json={
+            j = self.json(self.post("https://courses.zju.edu.cn/api/my-courses", retry=True, json={
                 "fields": COURSE_FIELDS, "page": page, "page_size": 100,
                 "conditions": {"status": ["ongoing", "notStarted", "closed"], "keyword": "",
                                "classify_type": "recently_started", "display_studio_list": False},
@@ -306,27 +379,27 @@ class Zju:
         3. 預覽器的轉檔 PDF — document/{rid}/url?preview=true 回 {url}（Kcalb35 / fish-can 的做法）
         活動未開放時三層都 403，這是伺服器權限，不繞。"""
         base = "https://courses.zju.edu.cn/api/uploads"
-        r = self.get(f"{base}/reference/{rid}/blob", stream=True)
-        if r.ok:
-            return r, "下載"
-        r.close()
-        r = self.get(f"{base}/{uid}/blob", stream=True)
-        if r.ok:
-            return r, "原檔"
-        r.close()
-        code = r.status_code
+        codes = []
+        for url, src in ((f"{base}/reference/{rid}/blob", "下載"), (f"{base}/{uid}/blob", "原檔")):
+            r = self.get(url, stream=True)
+            if r.ok:
+                return r, src
+            codes.append(r.status_code)
+            r.close()
         r = self.get(f"{base}/reference/document/{rid}/url", params={"preview": "true"})
+        codes.append(r.status_code)
         if r.ok:
             try:
                 url = r.json().get("url")
             except ValueError:
                 url = None
             if url:
-                r = self.get(url, stream=True)
+                r = self.get(secure_url(urljoin(base, url)), stream=True)
                 if r.ok:
                     return r, "預覽PDF"
-                code = r.status_code
-        raise ZjuError(f"下載失敗 HTTP {code}")
+                codes.append(r.status_code)
+                r.close()
+        raise DownloadError(f"下載失敗 HTTP {'/'.join(map(str, codes))}", codes)
 
     def todos(self) -> list[dict]:
         self.ensure()
@@ -439,14 +512,30 @@ class Manifest:
         os.replace(tmp, self.path)
 
 
-def stream_to(r: requests.Response, dest: Path) -> Path:
-    """寫暫存檔再 rename，中斷不會留下半截檔被當成已下載。"""
+def stream_to(r: requests.Response, dest: Path, limit: int | None = None) -> Path:
+    """寫暫存檔再 rename；驗證長度、拒收空檔和錯誤頁，免得壞檔被記進 manifest 後永遠不再重抓。"""
+    expected = r.headers.get("Content-Length")
+    expected = int(expected) if expected and expected.isdigit() and not r.headers.get("Content-Encoding") else None
+    if limit and expected and expected > limit:
+        r.close()
+        raise TooBig(f"{expected / 2**20:.0f}MB")
+    if "text/html" in r.headers.get("Content-Type", "") and dest.suffix.lower() not in (".html", ".htm"):
+        r.close()
+        raise ZjuError("伺服器回傳 HTML（錯誤頁或登入頁），不存檔")
     dest.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".part-")
     try:
+        written = 0
         with os.fdopen(fd, "wb") as f:
             for chunk in r.iter_content(1 << 20):
                 f.write(chunk)
+                written += len(chunk)
+                if limit and written > limit:
+                    raise TooBig(f">{limit / 2**20:.0f}MB")
+        if written == 0:
+            raise ZjuError("伺服器回傳空檔")
+        if expected is not None and written != expected:
+            raise ZjuError(f"下載不完整：{written}/{expected} bytes")
         with open(tmp, "rb") as f:
             head = f.read(5)
         # preview 版常是 PDF，但檔名還是 .pptx/.docx — 補副檔名免得打不開
@@ -471,9 +560,12 @@ def local_time(iso: str | None, fmt: str = "%m-%d %H:%M") -> str:
     if not iso:
         return "時間未定"
     try:
-        return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone().strftime(fmt)
+        d = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
     except ValueError:
         return iso
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=CST)
+    return d.astimezone().strftime(fmt)
 
 
 def match_courses(courses: list[dict], keys: list[str], include_all: bool) -> list[dict]:
@@ -500,14 +592,14 @@ def render_transcript(items: list[dict], fmt: str, title: str) -> str:
     lines = []
     if fmt == "srt":
         for i, c in enumerate(items, 1):
-            lines += [str(i), f"{fmt_ts(c['BeginSec'])} --> {fmt_ts(c['EndSec'])}", c.get("Text", ""), ""]
+            lines += [str(i), f"{fmt_ts(c.get('BeginSec', 0))} --> {fmt_ts(c.get('EndSec', 0))}", c.get("Text", ""), ""]
     elif fmt == "md":
         lines.append(f"# {title}\n")
         for c in items:
-            lines.append(f"**[{fmt_ts(c['BeginSec'], False)}]** {c.get('Text', '')}  ")
+            lines.append(f"**[{fmt_ts(c.get('BeginSec', 0), False)}]** {c.get('Text', '')}  ")
     else:
         for c in items:
-            lines.append(f"[{fmt_ts(c['BeginSec'], False)}] {c.get('Text', '')}")
+            lines.append(f"[{fmt_ts(c.get('BeginSec', 0), False)}] {c.get('Text', '')}")
     return "\n".join(lines) + "\n"
 
 
@@ -515,19 +607,29 @@ def images_to_pdf(paths: list[Path], pdf: Path):
     import img2pdf
     from PIL import Image
 
-    fixed = []
-    for p in paths:
-        try:
-            img2pdf.convert(str(p))  # 能直接嵌入就不重新編碼（無損、省記憶體）
-            fixed.append(str(p))
-        except Exception:
-            q = p.with_suffix(".conv.jpg")
-            with Image.open(p) as im:
-                im.convert("RGB").save(q, quality=92)
-            fixed.append(str(q))
     tmp = pdf.with_name(".part-" + pdf.name)
-    tmp.write_bytes(img2pdf.convert(fixed))
-    os.replace(tmp, pdf)
+
+    def write(srcs):
+        with open(tmp, "wb") as f:  # 直接串流進檔案，不在記憶體組整份 PDF
+            img2pdf.convert([str(x) for x in srcs], outputstream=f)
+
+    try:
+        try:
+            write(paths)  # 智雲截圖幾乎都是 JPEG：直接嵌入，不重新編碼
+        except Exception:
+            fixed = []  # 有 alpha / 特殊格式的才轉 JPEG
+            for p in paths:
+                with Image.open(p) as im:
+                    if im.format == "JPEG" and im.mode in ("RGB", "L", "CMYK"):
+                        fixed.append(p)
+                        continue
+                    q = p.with_suffix(".conv.jpg")
+                    im.convert("RGB").save(q, quality=92)
+                    fixed.append(q)
+            write(fixed)
+        os.replace(tmp, pdf)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def resolve_subs(z: Zju, a) -> list[dict]:
@@ -592,16 +694,22 @@ def cmd_sync(a):
         cdir = root / safe_name(f"{c['name']} ({c['id']})" if c["name"] in dup else c["name"])
         items = z.uploads(c["id"])
         log(f"== {c['name']}（{len(items)} 個檔）")
-        seen: set[str] = set()
+        # 同名不同檔：全部加 id，命名不依 API 回傳順序（順序變了也不會重抓、不會互換）
+        uids_by_name: dict[str, set] = {}
+        for _, u in items:
+            uids_by_name.setdefault(safe_name(u.get("name") or str(u["id"])), set()).add(u["id"])
+        seen_keys: set[str] = set()
         for a_, u in items:
             act = a_.get("title", "")
             uid, rid = u["id"], u.get("reference_id") or u["id"]
             key = f"{c['id']}:{uid}"
-            name = safe_name(u.get("name") or f"{uid}")
-            if name in seen:  # 同課程同名檔：加 id 區分
+            if key in seen_keys:  # 同一檔同時掛在活動和作業
+                continue
+            seen_keys.add(key)
+            name = safe_name(u.get("name") or str(uid))
+            if len(uids_by_name[name]) > 1:
                 stem, dot, ext = name.rpartition(".")
                 name = f"{stem} ({uid}).{ext}" if dot else f"{name} ({uid})"
-            seen.add(name)
             rec = man.get(key)
             if rec and (root / rec["path"]).exists():
                 skipped += 1
@@ -620,10 +728,12 @@ def cmd_sync(a):
                 continue
             jobs.append((key, uid, rid, cdir / name, a_))
 
+    limit = a.max_size * 2**20 if a.max_size else None
+
     def fetch(job):
         key, uid, rid, dest, _ = job
-        r, preview = z.upload_response(uid, rid)
-        return stream_to(r, dest), preview
+        r, src = z.upload_response(uid, rid)
+        return stream_to(r, dest, limit), src  # API 沒給 size 的檔，靠 Content-Length 把關
 
     # 多檔並行：單條連線常被伺服器限速，並行吃滿頻寬；manifest 只在主執行緒寫
     with ThreadPoolExecutor(max_workers=max(1, a.jobs)) as pool:
@@ -637,8 +747,10 @@ def cmd_sync(a):
                               "activity": act, "at": dt.datetime.now().isoformat(timespec="seconds")})
                 new += 1
                 print(f"[{src}] {dest.relative_to(root)}", flush=True)
+            except TooBig as e:
+                big.append(f"{dest0.parent.name}/{dest0.name}  {e}")
             except Exception as e:
-                if a_.get("is_started") is False and "HTTP 403" in str(e):
+                if a_.get("is_started") is False and 403 in getattr(e, "codes", ()):
                     # 老師排程開放：伺服器對所有端點都 403（不繞），開放後下次 sync 自動抓
                     pending.append(f"{dest0.parent.name}/{dest0.name}（{local_time(a_.get('start_time'))} 開放）")
                     continue
@@ -719,9 +831,9 @@ def ppt_one(z: Zju, a, root: Path, s: dict):
     try:
         def grab(iu):
             i, u = iu
-            p = tmpdir / f"{i:04d}{Path(urlparse(u).path).suffix or '.jpg'}"
+            p = tmpdir / f"{i:04d}{Path(urlparse(u).path).suffix[:5] or '.jpg'}"
             for attempt in range(5):
-                r = z.get(u)
+                r = z.get(secure_url(u))
                 if r.ok and r.content:
                     p.write_bytes(r.content)
                     return p
@@ -766,7 +878,11 @@ def cmd_transcript(a):
 
 def main():
     p = argparse.ArgumentParser(prog="zju.py", description="學在浙大 / 智雲課堂 CLI")
-    default_out = os.environ.get("ZJU_OUT") or load_config().get("out") or str(DEFAULT_OUT)
+    try:
+        default_out = os.environ.get("ZJU_OUT") or load_config().get("out") or str(DEFAULT_OUT)
+    except ZjuError as e:
+        log(f"錯誤：{e}")
+        sys.exit(1)
     p.add_argument("--out", default=default_out, help=f"輸出根目錄（目前 {default_out}；config.json 的 out 或 ZJU_OUT 可改）")
     sp = p.add_subparsers(dest="cmd", required=True)
 

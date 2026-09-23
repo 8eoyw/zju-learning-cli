@@ -48,5 +48,74 @@ class Offline(unittest.TestCase):
             self.assertEqual((d / "out.pdf").read_bytes()[:5], b"%PDF-")
 
 
+    def test_safe_name_windows(self):
+        self.assertEqual(zju.safe_name("CON.pdf"), "_CON.pdf")
+        self.assertEqual(zju.safe_name("x . "), "x")
+
+    def test_local_time_naive_is_beijing(self):
+        # 沒帶時區 = 北京時間；換算成 UTC+8 顯示應不變
+        import datetime as dt
+        naive = zju.local_time("2026-09-27 23:59:00", "%Y-%m-%d %H:%M")
+        want = dt.datetime(2026, 9, 27, 23, 59, tzinfo=zju.CST).astimezone().strftime("%Y-%m-%d %H:%M")
+        self.assertEqual(naive, want)
+
+    def test_secure_url(self):
+        self.assertEqual(zju.secure_url("http://video.cmc.zju.edu.cn/a.jpg"), "https://video.cmc.zju.edu.cn/a.jpg")
+        self.assertEqual(zju.secure_url("http://example.com/a.jpg"), "http://example.com/a.jpg")
+
+    def test_http_never_carries_cookies(self):
+        """.zju.edu.cn 的 SSO cookie 沒設 Secure：http:// 請求必須被剝掉 Cookie。"""
+        from unittest import mock
+        import requests
+        seen = {}
+
+        def fake_send(self_, request, **kw):
+            seen["headers"] = dict(request.headers)
+            r = requests.Response()
+            r.status_code = 200
+            r._content = b"ok"
+            r.url = request.url
+            r.request = request
+            return r
+
+        z = zju.Zju.__new__(zju.Zju)
+        z.jar = requests.cookies.RequestsCookieJar()
+        z.jar.set("iPlanetDirectoryPro", "SECRET", domain=".zju.edu.cn", path="/")
+        import threading
+        z._tl = threading.local()
+        with mock.patch.object(requests.adapters.HTTPAdapter, "send", fake_send):
+            z.s.get("http://video.cmc.zju.edu.cn/x.jpg")
+            self.assertNotIn("Cookie", seen["headers"])
+            z.s.get("https://courses.zju.edu.cn/api/x")
+            self.assertIn("SECRET", seen["headers"].get("Cookie", ""))
+
+    def test_stream_to_rejects_truncated(self):
+        import io
+        import requests
+
+        def resp(body, length=None, ctype="application/octet-stream"):
+            r = requests.Response()
+            r.status_code = 200
+            r.raw = io.BytesIO(body)
+            r.headers["Content-Type"] = ctype
+            if length is not None:
+                r.headers["Content-Length"] = str(length)
+            return r
+
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            with self.assertRaises(zju.ZjuError):
+                zju.stream_to(resp(b"abc", 10), d / "a.bin")
+            with self.assertRaises(zju.ZjuError):
+                zju.stream_to(resp(b""), d / "b.bin")
+            with self.assertRaises(zju.ZjuError):
+                zju.stream_to(resp(b"<html>", ctype="text/html; charset=utf-8"), d / "c.pdf")
+            with self.assertRaises(zju.TooBig):
+                zju.stream_to(resp(b"x" * 10, 10), d / "d.bin", limit=5)
+            self.assertEqual(sorted(p.name for p in d.iterdir()), [])  # 失敗不留任何檔
+            out = zju.stream_to(resp(b"%PDF-1.4 ok", 11), d / "e.pptx")
+            self.assertEqual(out.name, "e.pptx.pdf")
+
+
 if __name__ == "__main__":
     unittest.main()
