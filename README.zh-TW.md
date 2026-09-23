@@ -32,6 +32,11 @@ zju login
 
 沒有 uv 的話：`pip install requests img2pdf pillow keyring numpy`，再用 `python zju.py ...` 執行。
 
+也可以不開終端機，直接雙擊登入腳本（每次都會清掉上一次的學號、密碼和 cookie，重新登入）：
+
+- macOS：`zju_login.command`，在 Finder 雙擊會開一個終端機視窗。用 git clone 的可以直接雙擊；下載 zip 的會被 Gatekeeper 擋下，先執行一次 `chmod +x zju_login.command && xattr -c zju_login.command`。
+- Windows：`zju_login.bat`，需要 Python 啟動器 `py -3.11`，並先用 pip 裝好上面的相依套件。
+
 ## 使用
 
 ```bash

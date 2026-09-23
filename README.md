@@ -32,6 +32,11 @@ zju login
 
 没有 uv 的话：`pip install requests img2pdf pillow keyring numpy`，再用 `python zju.py ...` 运行。
 
+也可以不开终端，直接双击登录脚本（每次都会清掉上一次的学号、密码和 cookie，重新登录）：
+
+- macOS：`zju_login.command`，在访达里双击会打开一个终端窗口。用 git clone 下载的可以直接双击；下载 zip 的会被 Gatekeeper 拦下，先运行一次 `chmod +x zju_login.command && xattr -c zju_login.command`。
+- Windows：`zju_login.bat`，需要 Python 启动器 `py -3.11`，并先用 pip 装好上面的依赖。
+
 ## 使用
 
 ```bash
