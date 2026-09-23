@@ -10,7 +10,7 @@
 
 | 指令 | 作用 |
 | --- | --- |
-| `zju login` | 設定學號，密碼存進系統憑證庫（macOS Keychain；其他系統走 [keyring](https://pypi.org/project/keyring/)） |
+| `zju login` | 設定學號，密碼存進系統憑證庫（macOS Keychain、Windows 認證管理員；其他系統走 [keyring](https://pypi.org/project/keyring/)） |
 | `zju courses [--all]` | 課程列表（預設只列最新學年） |
 | `zju sync [課程...]` | 增量同步課件到 `<輸出目錄>/<課程>/` |
 | `zju todo` | 待辦事項，依截止時間排序（本地時區） |
@@ -92,7 +92,7 @@ zju transcript --days 1 --format md
 
 ## 安全性
 
-- 密碼只存在系統憑證庫。macOS 由系統 `security` 在終端機提示輸入，不會出現在命令列參數或 shell 歷史紀錄。也可以改用環境變數 `ZJU_USER` / `ZJU_PASS`。
+- 密碼只存在系統憑證庫。macOS 由系統 `security`、Windows 由 Python `getpass` 在終端機提示輸入，不會出現在命令列參數或 shell 歷史紀錄。也可以改用環境變數 `ZJU_USER` / `ZJU_PASS`。
 - 登入時密碼先用 CAS 提供的公鑰加密再送出，跟網頁登入的做法相同。
 - Session cookie 以 JSON（不是 pickle）快取在 `~/.config/zju-learning/cookies.json`；在 macOS／Linux 上檔案權限是 `0600`，目錄是 `0700`。快取位置可用環境變數 `ZJU_STATE_DIR` 覆寫。
 - Cookie 只會透過 HTTPS 送往 `*.zju.edu.cn`，明文 `http://` 請求一律不帶。沒有任何遙測。
@@ -100,7 +100,7 @@ zju transcript --days 1 --format md
 
 ## 免責聲明
 
-只在 macOS 上實測過；Linux、Windows 理論上可以使用，但沒有測試過（Windows 請用 `python zju.py`）。
+在 macOS 和 Windows 上實測過；Linux 理論上可以使用，但沒有測試過。
 
 僅供個人學習使用。課件的著作權屬於授課教師與學校，請勿散布下載的內容；使用時請遵守學校的相關規定，不要高頻或大量抓取。學校的 API 沒有公開文件，隨時可能改版。
 
