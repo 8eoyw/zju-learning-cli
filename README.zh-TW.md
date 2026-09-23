@@ -88,7 +88,7 @@ zju transcript --days 1 --format md
 
 - 密碼只存在系統憑證庫。macOS 由系統 `security` 在終端機提示輸入，不會出現在命令列參數或 shell 歷史紀錄。也可以改用環境變數 `ZJU_USER` / `ZJU_PASS`。
 - 登入時密碼先用 CAS 提供的公鑰加密再送出，跟網頁登入的做法相同。
-- Session cookie 以 JSON（不是 pickle）快取在 `~/.config/zju-learning/cookies.json`；在 macOS／Linux 上檔案權限是 `0600`，目錄是 `0700`。
+- Session cookie 以 JSON（不是 pickle）快取在 `~/.config/zju-learning/cookies.json`；在 macOS／Linux 上檔案權限是 `0600`，目錄是 `0700`。快取位置可用環境變數 `ZJU_STATE_DIR` 覆寫。
 - Cookie 只會透過 HTTPS 送往 `*.zju.edu.cn`，明文 `http://` 請求一律不帶。沒有任何遙測。
 - TLS 驗證失敗會直接報錯，不會自動重試或改走 proxy，避免把中間人攻擊誤當成網路不穩。
 

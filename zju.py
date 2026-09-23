@@ -45,7 +45,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 KEYCHAIN_SERVICE = "zju-learning"
-STATE_DIR = Path.home() / ".config" / "zju-learning"
+STATE_DIR = Path(os.environ.get("ZJU_STATE_DIR") or (Path.home() / ".config" / "zju-learning"))
 CONFIG_FILE = STATE_DIR / "config.json"
 COOKIE_FILE = STATE_DIR / "cookies.json"
 # 這兩台只支援 1024-bit DHE / 靜態 RSA，OpenSSL 3 預設拒絕；降級只套用在它們身上
