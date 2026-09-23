@@ -1,4 +1,4 @@
-"""不連網的單元測試：python -m unittest discover tests（需 requests / img2pdf / pillow）。"""
+"""不連網的單元測試：python -m unittest discover tests（需 requests / img2pdf / pillow / numpy）。"""
 import importlib.util
 import tempfile
 import unittest
@@ -23,6 +23,40 @@ class Offline(unittest.TestCase):
     def test_safe_name(self):
         self.assertEqual(zju.safe_name('a/b:c*?"<>|'), "a_b_c______")
         self.assertEqual(zju.safe_name("..."), "_")
+
+    def test_dedup_slides(self):
+        from PIL import Image, ImageDraw
+
+        def slide(lines, ink=None, bg=255):
+            im = Image.new("RGB", (1280, 720), (bg,) * 3)
+            d = ImageDraw.Draw(im)
+            for x, y, w in lines:  # 一行字 ≈ 一條細橫線
+                d.rectangle([x, y, x + w, y + 8], fill=(0, 0, 0))
+            if ink:  # 老師的紅筆註記
+                d.line(ink, fill=(220, 0, 0), width=5)
+            return im
+
+        a_title = [(100, 60, 600)]
+        a_full = a_title + [(120, 200, 800), (120, 280, 700), (120, 360, 900)]
+        b = [(100, 60, 400), (150, 250, 500), (150, 450, 600), (300, 600, 300)]
+        scribble = [(700, 300), (900, 420), (1100, 300), (900, 200)]
+        pages = [
+            slide(a_title),           # 0 動畫第一步 → 被 1 包含
+            slide(a_full),            # 1 保留
+            slide(b),                 # 2 → 被 3（寫了註記）包含
+            slide([], bg=0),          # 3 全黑過場
+            slide(b, ink=scribble),   # 4 保留
+            slide(b),                 # 5 擦掉註記的乾淨版 → 被 4 包含
+            slide(a_full),            # 6 翻回前面 → 被 1 包含
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            paths = []
+            for i, im in enumerate(pages):
+                p = Path(d) / f"{i:04d}.jpg"
+                im.save(p, quality=85)
+                paths.append(p)
+            kept = zju.dedup_slides(paths)
+        self.assertEqual([p.stem for p in kept], ["0001", "0004"])
 
     def test_srt(self):
         out = zju.render_transcript([{"BeginSec": 61.5, "EndSec": 63, "Text": "你好"}], "srt", "t")

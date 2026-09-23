@@ -17,7 +17,7 @@
 | `zju classroom search 关键字` | 在智云课堂找课，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出该课每一堂的 `sub_id` |
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的课 |
-| `zju ppt --course <id> \| --days N` | 智云 PPT 截图 → `<课程>/智云PPT/<堂>.pdf` |
+| `zju ppt --course <id> \| --days N [--dedup]` | 智云 PPT 截图 → `<课程>/智云PPT/<堂>.pdf` |
 | `zju transcript --course <id> \| --days N` | 语音转录 → `<课程>/转录/<堂>.txt\|srt\|md` |
 
 ## 安装
@@ -42,7 +42,7 @@ zju sync --videos --max-size 0     # 连音视频和大文件一起抓
 zju sync -j 8                      # 并行数（默认 4）
 
 zju classroom day --days 7
-zju ppt --days 1                   # 今天所有课的 PPT
+zju ppt --days 1 --dedup           # 今天所有课的 PPT，重复截图只留最完整的一张
 zju transcript --days 1 --format md
 ```
 
@@ -61,6 +61,7 @@ zju transcript --days 1 --format md
 - **增量同步**：以 `.zju_manifest.json` 记录 upload id，而不是比对文件名和大小；老师换了新版（新 id）才会重抓。
 - **下载完整性**：先写 `.part-*`，核对 `Content-Length` 后才 rename；空文件、截断、服务器回的 HTML 错误页都不会被记成已下载。
 - **并行下载**：课件默认 4 个文件同时，PPT 截图 8 张同时；每条线程有自己的 session，共用 cookie jar。遇到 429/503 会照 `Retry-After` 退让。
+- **PPT 去重**（`--dedup`）：智云是对投影画面定时截图，同一页会因动画逐步出现、老师边讲边写、翻回前面而被截很多次。一页的笔画若全都还在后面那页（或之前留下的某页）里就删掉，所以动画只留跑完的那张、手写只留写完的那张，批注不会丢。用局部对比找笔画，白底、黑底、底图纹理、教学视频都适用；实测三堂课 73→68、81→48、176→99 页，逐页核对无误删。`--keep-images` 仍保留全部原图。
 - **默认直连**，连不上才改走系统 proxy；连接 timeout 6 秒，定时运行时不会卡死。只有幂等请求会自动重试，登录 POST 不会被重送。
 - **学年判断**：学校常常不把旧课程标成已结束（`is_closed`），因此改用 `academic_year_id` 找最新学年。
 - **同名课程**（不同教学班）分开存放；同一课程里的同名文件一律加上 id，命名不受 API 返回顺序影响。

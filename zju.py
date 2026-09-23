@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["requests", "img2pdf", "pillow", "keyring"]
+# dependencies = ["requests", "img2pdf", "pillow", "keyring", "numpy"]
 # ///
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 8eoyw
@@ -18,7 +18,7 @@ API 邏輯移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py classroom search 關鍵字        # 智雲課堂找課（id 與學在浙大不同）
   zju.py classroom subs <cid>          # 列出每堂課
   zju.py classroom day [日期] [--days N]
-  zju.py ppt --course <cid> | --days N # 智雲 PPT 截圖合併 PDF
+  zju.py ppt --course <cid> | --days N [--dedup]  # 智雲 PPT 截圖合併 PDF
   zju.py transcript --course <cid> | --days N [--format txt|srt|md]
 """
 from __future__ import annotations
@@ -632,6 +632,59 @@ def images_to_pdf(paths: list[Path], pdf: Path):
         tmp.unlink(missing_ok=True)
 
 
+def dedup_slides(paths: list[Path], max_lost_cells: int = 2) -> list[Path]:
+    """智雲截圖去重。智雲是對投影畫面定時截圖，同一頁會因動畫逐步出現、老師邊講邊寫、
+    翻回前面而被截很多次。規則只有一條：一頁的筆畫若全都還在後面那頁（或之前留下的某頁）裡，
+    它就是多餘的——所以連續的一串只留最後、最完整的一張，註記不會丟。
+
+    「筆畫」= 跟 15×15 鄰域中位數差很多的像素，大片純色（白底、黑底、影片畫面）不算；
+    八成以上的頁都有的（底圖紋理、黑邊、頁腳）也不算。「全都還在」= 消失的筆畫沒有聚成塊：
+    有 4 個以上筆畫像素消失的 8×8 格不超過 max_lost_cells 個（JPEG 雜訊零星，真的少了東西會成塊；
+    再高就抓不到影片裡又細又淡的線）。
+    在三堂課（白底英文、底圖＋手寫、黑底教學影片混檔案總管）逐頁核對過，沒有誤刪。
+    """
+    import numpy as np
+    from PIL import Image, ImageFilter
+
+    T, W, H = 40, 512, 288  # 灰階門檻；解析度再低，細的手寫筆跡就糊掉看不見了
+    if len(paths) < 2:
+        return list(paths)
+
+    def prep(p):
+        with Image.open(p) as im:
+            g = im.convert("L").resize((W, H), Image.BOX)
+        f = np.asarray(g, dtype=np.int16)
+        return f, strokes(f)
+
+    def strokes(f):
+        bg = Image.fromarray(f.astype(np.uint8)).filter(ImageFilter.MedianFilter(15))
+        return np.abs(f - np.asarray(bg, dtype=np.int16)) > T
+
+    frames, raw = zip(*map(prep, paths))
+    frames = np.stack(frames)
+    med = np.median(frames, axis=0).astype(np.int16)
+    # 版面 = 八成以上的頁在那裡都一樣的筆畫；只看中位數的話，一張講了半堂課的投影片會被當成版面
+    layout = strokes(med) & ((np.abs(frames - med) <= T).sum(axis=0) >= 0.8 * len(frames))
+    masks = [m & ~(layout & (np.abs(f - med) <= T)) for f, m in zip(frames, raw)]
+
+    def lost(i, js):  # i 的筆畫在 js 各頁消失成塊的格數
+        gone = masks[i] & (np.abs(frames[i] - frames[js]) > T)
+        return (gone.reshape(len(js), H // 8, 8, W // 8, 8).sum(axis=(2, 4)) >= 4).sum(axis=(1, 2))
+
+    keep: list[int] = []
+    for j in range(len(frames)):
+        if frames[j].std() < 3:  # 全黑 / 全白過場
+            continue
+        if keep and lost(keep[-1], [j])[0] <= max_lost_cells:
+            keep[-1] = j  # 前一張是這張的子集（動畫沒跑完、還沒寫完）→ 換成較完整的這張
+            continue
+        # 翻回講過的頁、擦掉註記的乾淨版；近乎空白的頁什麼都「包含得住」，不拿來比
+        if keep and masks[j].sum() >= 400 and (lost(j, keep) <= max_lost_cells).any():
+            continue
+        keep.append(j)
+    return [paths[k] for k in keep] or list(paths)
+
+
 def resolve_subs(z: Zju, a) -> list[dict]:
     if a.course:
         subs = z.course_subs(a.course)
@@ -842,11 +895,13 @@ def ppt_one(z: Zju, a, root: Path, s: dict):
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             paths = list(pool.map(grab, enumerate(urls)))  # map 保序 = 頁序
+        pages = dedup_slides(paths) if a.dedup else paths
         cdir.mkdir(parents=True, exist_ok=True)
-        images_to_pdf(paths, pdf)
-        if a.keep_images:
+        images_to_pdf(pages, pdf)
+        if a.keep_images:  # 留全部原圖，去重只影響 PDF
             shutil.copytree(tmpdir, cdir / safe_name(s["sub_name"]), dirs_exist_ok=True)
-        print(f"[PDF] {pdf.relative_to(root)}（{len(paths)} 頁）")
+        note = f"，去重前 {len(paths)}" if len(pages) != len(paths) else ""
+        print(f"[PDF] {pdf.relative_to(root)}（{len(pages)} 頁{note}）")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -924,6 +979,8 @@ def main():
         x.add_argument("--force", action="store_true", help="已存在也重抓")
         if name == "ppt":
             x.add_argument("--keep-images", action="store_true")
+            x.add_argument("--dedup", action="store_true",
+                           help="刪掉重複截圖（動畫逐步出現、邊講邊寫、翻回前頁），每頁只留最完整的一張")
         else:
             x.add_argument("--format", choices=["txt", "srt", "md"], default="txt")
         x.set_defaults(fn=fn)
