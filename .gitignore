@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.zju_manifest.json
+.part-*
+.env
+cookies.pkl
+config.json
