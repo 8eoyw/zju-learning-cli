@@ -13,7 +13,7 @@ API 邏輯移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
 
   zju.py login                         # 首次：存學號，密碼進 macOS Keychain
   zju.py courses [--all]               # 學在浙大課程列表
-  zju.py sync [課程...] [--dry-run]     # 增量同步課件（含老師未開放下載的 preview）
+  zju.py sync [課程...] [--dry-run]     # 增量同步課程附件（含排程中的活動）
   zju.py todo                          # 待辦
   zju.py classroom search 關鍵字        # 智雲課堂找課（id 與學在浙大不同）
   zju.py classroom subs <cid>          # 列出每堂課
@@ -45,7 +45,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 KEYCHAIN_SERVICE = "zju-learning"
-STATE_DIR = Path.home() / ".config" / "zju-learning"
+STATE_DIR = Path(os.environ.get("ZJU_STATE_DIR") or (Path.home() / ".config" / "zju-learning"))
 CONFIG_FILE = STATE_DIR / "config.json"
 COOKIE_FILE = STATE_DIR / "cookies.json"
 # 這兩台只支援 1024-bit DHE / 靜態 RSA，OpenSSL 3 預設拒絕；降級只套用在它們身上
@@ -192,9 +192,9 @@ def secure_url(u: str) -> str:
 
 
 def refer_params(activity: dict | None) -> dict | None:
-    """/uploads/{id}/blob 的 refer 參數，規則同前端 getDownloadRefer（66491-*.js）：
-    classroom→classroom_activity、exam 不帶、其餘→learning_activity。
-    活動排程未開放（is_started=false）時，帶上才能拿到原檔；伺服器只認 snake_case。"""
+    """組 /uploads/{id}/blob 的 reference 參數，與官方網頁前端下載鈕送出的相同：
+    classroom→classroom_activity、exam 不帶、其餘→learning_activity；
+    伺服器只認 snake_case 參數名。"""
     if not activity or not activity.get("id"):
         return None
     t = activity.get("type")
@@ -386,25 +386,25 @@ class Zju:
             page += 1
 
     def upload_response(self, uid: int, rid: int, activity: dict | None = None) -> tuple[requests.Response, str]:
-        """四層退路，回 (response, 來源)：
-        1. reference blob — 正常下載
-        2. upload blob — 老師關了下載仍給原格式（ZLA / eWloYW8 / xzzd-pro 的做法）
-        3. upload blob + refer — 活動排程未開放（is_started=false）時仍回原檔，refer 參數由 refer_params 組
-        4. 預覽器的轉檔 PDF — document/{rid}/url?preview=true 回 {url}（Kcalb35 / fish-can 的做法）
-        refer 也 403 才是真權限鎖（exam 活動不帶 refer）。"""
+        """附件下載來源，依優先序嘗試、採用第一個能回檔的，回 (response, 來源)：
+        1. reference blob — 常規下載
+        2. upload blob — 原始檔
+        3. upload blob + reference 參數 — 參數與官方網頁前端相同，部分活動的附件由此提供
+        4. 預覽器的轉檔 PDF — document/{rid}/url?preview=true 回 {url}
+        全部來源都不可用時丟 DownloadError（codes 為各來源的 HTTP 碼）。"""
         base = "https://courses.zju.edu.cn/api/uploads"
-        codes = []
-        for url, src in ((f"{base}/reference/{rid}/blob", "下載"), (f"{base}/{uid}/blob", "原檔")):
-            r = self.get(url, stream=True)
-            if r.ok:
-                return r, src
-            codes.append(r.status_code)
-            r.close()
+        sources = [
+            (f"{base}/reference/{rid}/blob", None, "下載"),
+            (f"{base}/{uid}/blob", None, "原檔"),
+        ]
         refer = refer_params(activity)
         if refer:
-            r = self.get(f"{base}/{uid}/blob", params=refer, stream=True)
+            sources.append((f"{base}/{uid}/blob", refer, "排程原檔"))
+        codes = []
+        for url, params, src in sources:
+            r = self.get(url, params=params, stream=True)
             if r.ok:
-                return r, "排程原檔"
+                return r, src
             codes.append(r.status_code)
             r.close()
         r = self.get(f"{base}/reference/document/{rid}/url", params={"preview": "true"})
@@ -772,7 +772,7 @@ def cmd_sync(a):
                 big.append(f"{dest0.parent.name}/{dest0.name}  {e}")
             except Exception as e:
                 if a_.get("is_started") is False and 403 in getattr(e, "codes", ()):
-                    # 排程未開放且 refer 也 403（exam 不帶 refer 等）：開放後下次 sync 自動抓
+                    # 排程未開放且所有來源皆回 403：開放後下次 sync 自動抓
                     pending.append(f"{dest0.parent.name}/{dest0.name}（{local_time(a_.get('start_time'))} 開放）")
                     continue
                 failed += 1

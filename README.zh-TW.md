@@ -74,22 +74,22 @@ zju transcript --days 1 --format md
 - `courses.zju.edu.cn` 與 `identity.zju.edu.cn` 只支援 1024-bit DHE／靜態 RSA，OpenSSL 3 預設拒絕連線（`DH_KEY_TOO_SMALL`）。`SECLEVEL=1` 只套用在這兩台，其他主機維持預設的 TLS 設定。
 - 智雲的 `_token` cookie 設在 `.zju.edu.cn` 父網域，而不是 `classroom.zju.edu.cn`。
 
-## 關閉下載的課件
+## 附件下載來源
 
-老師關閉下載時，依序嘗試四條路：
+`sync` 對每個附件依優先序嘗試以下來源，採用第一個能回檔的：
 
-1. `/api/uploads/reference/{rid}/blob`：正常下載
-2. `/api/uploads/{id}/blob`：多數情況仍然拿得到原格式（ZLA、[eWloYW8/ZJU-course-material-download](https://github.com/eWloYW8/ZJU-course-material-download)、[xzzd-pro](https://github.com/xzzd-pro/xzzd-pro) 用的方式）
-3. `/api/uploads/{id}/blob?refer_id={活動id}&refer_type=learning_activity`：活動排程未開放時仍回原檔。`refer` 參數與官方前端下載鈕組出的相同（`classroom` 活動用 `classroom_activity`、考試不帶）；伺服器只認 snake_case 參數
-4. `/api/uploads/reference/document/{rid}/url?preview=true`：預覽器轉出來的 PDF（[Kcalb35/Tronclass-pdf-downloaderforChrome](https://github.com/Kcalb35/Tronclass-pdf-downloaderforChrome)、[fish-can/TronClass-PDF-Downloader](https://github.com/fish-can/TronClass-PDF-Downloader) 用的方式）
+1. `/api/uploads/reference/{rid}/blob`：常規下載
+2. `/api/uploads/{id}/blob`：原始檔案
+3. `/api/uploads/{id}/blob?refer_id={活動id}&refer_type=learning_activity`：reference 參數與官方網頁前端下載鈕送出的相同（`classroom` 活動用 `classroom_activity`、考試不帶）；部分活動的附件只有此來源提供，來源標記 `排程原檔`
+4. `/api/uploads/reference/document/{rid}/url?preview=true`：預覽器轉出的 PDF（[Kcalb35/Tronclass-pdf-downloaderforChrome](https://github.com/Kcalb35/Tronclass-pdf-downloaderforChrome)、[fish-can/TronClass-PDF-Downloader](https://github.com/fish-can/TronClass-PDF-Downloader) 採用的方式）
 
-**老師排定之後才開放的活動**（`is_started=false`），前兩個端點回 403，但第 3 條帶 refer 仍回原檔，會照常下載、來源標記 `排程原檔`。只有帶 refer 仍然 403 才標成 `[未開放]（開放時間）`，不算失敗，開放後下次 `sync` 會自動抓。
+**排程尚未開放的活動**（`is_started=false`）通常由來源 3 照常下載；若所有來源都回 403，該檔案標記 `[未開放]（開放時間）`，不算失敗，開放後下次 `sync` 會自動抓。
 
 ## 安全性
 
 - 密碼只存在系統憑證庫。macOS 由系統 `security` 在終端機提示輸入，不會出現在命令列參數或 shell 歷史紀錄。也可以改用環境變數 `ZJU_USER` / `ZJU_PASS`。
 - 登入時密碼先用 CAS 提供的公鑰加密再送出，跟網頁登入的做法相同。
-- Session cookie 以 JSON（不是 pickle）快取在 `~/.config/zju-learning/cookies.json`；在 macOS／Linux 上檔案權限是 `0600`，目錄是 `0700`。
+- Session cookie 以 JSON（不是 pickle）快取在 `~/.config/zju-learning/cookies.json`；在 macOS／Linux 上檔案權限是 `0600`，目錄是 `0700`。 快取位置可用環境變數 `ZJU_STATE_DIR` 覆蓋。
 - Cookie 只會透過 HTTPS 送往 `*.zju.edu.cn`，明文 `http://` 請求一律不帶。沒有任何遙測。
 - TLS 驗證失敗會直接報錯，不會自動重試或改走 proxy，避免把中間人攻擊誤當成網路不穩。
 
