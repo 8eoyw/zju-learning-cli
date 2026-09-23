@@ -76,13 +76,14 @@ zju transcript --days 1 --format md
 
 ## 关闭下载的课件
 
-老师关闭下载时，依序尝试三条路：
+老师关闭下载时，依序尝试四条路：
 
 1. `/api/uploads/reference/{rid}/blob`：正常下载
 2. `/api/uploads/{id}/blob`：多数情况仍然拿得到原格式（ZLA、[eWloYW8/ZJU-course-material-download](https://github.com/eWloYW8/ZJU-course-material-download)、[xzzd-pro](https://github.com/xzzd-pro/xzzd-pro) 用的方式）
-3. `/api/uploads/reference/document/{rid}/url?preview=true`：预览器转出来的 PDF（[Kcalb35/Tronclass-pdf-downloaderforChrome](https://github.com/Kcalb35/Tronclass-pdf-downloaderforChrome)、[fish-can/TronClass-PDF-Downloader](https://github.com/fish-can/TronClass-PDF-Downloader) 用的方式）
+3. `/api/uploads/{id}/blob?refer_id={活动id}&refer_type=learning_activity`：活动排程未开放时仍回原档。`refer` 参数与官方前端下载钮组出的相同（`classroom` 活动用 `classroom_activity`、考试不带）；服务器只认 snake_case 参数
+4. `/api/uploads/reference/document/{rid}/url?preview=true`：预览器转出来的 PDF（[Kcalb35/Tronclass-pdf-downloaderforChrome](https://github.com/Kcalb35/Tronclass-pdf-downloaderforChrome)、[fish-can/TronClass-PDF-Downloader](https://github.com/fish-can/TronClass-PDF-Downloader) 用的方式）
 
-**老师排定之后才开放的活动**，服务器对以上所有端点都会回 403。这是权限控制，本工具不会尝试绕过：这类文件会标成 `[未开放]（开放时间）`，不算失败，开放后下次 `sync` 会自动抓。
+**老师排定之后才开放的活动**（`is_started=false`），前两个端点回 403，但第 3 条带 refer 仍回原档，会照常下载、来源标记 `排程原档`。只有带 refer 仍然 403 才标成 `[未开放]（开放时间）`，不算失败，开放后下次 `sync` 会自动抓。
 
 ## 安全性
 

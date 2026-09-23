@@ -191,6 +191,19 @@ def secure_url(u: str) -> str:
     return u
 
 
+def refer_params(activity: dict | None) -> dict | None:
+    """/uploads/{id}/blob 的 refer 參數，規則同前端 getDownloadRefer（66491-*.js）：
+    classroom→classroom_activity、exam 不帶、其餘→learning_activity。
+    活動排程未開放（is_started=false）時，帶上才能拿到原檔；伺服器只認 snake_case。"""
+    if not activity or not activity.get("id"):
+        return None
+    t = activity.get("type")
+    if t == "exam":
+        return None
+    return {"refer_id": activity["id"],
+            "refer_type": "classroom_activity" if t == "classroom" else "learning_activity"}
+
+
 class Zju:
     def __init__(self):
         self.jar = requests.cookies.RequestsCookieJar()  # 各執行緒 session 共用（CookieJar 自帶鎖）
@@ -372,18 +385,26 @@ class Zju:
                 return res
             page += 1
 
-    def upload_response(self, uid: int, rid: int) -> tuple[requests.Response, str]:
-        """三層退路，回 (response, 來源)：
+    def upload_response(self, uid: int, rid: int, activity: dict | None = None) -> tuple[requests.Response, str]:
+        """四層退路，回 (response, 來源)：
         1. reference blob — 正常下載
         2. upload blob — 老師關了下載仍給原格式（ZLA / eWloYW8 / xzzd-pro 的做法）
-        3. 預覽器的轉檔 PDF — document/{rid}/url?preview=true 回 {url}（Kcalb35 / fish-can 的做法）
-        活動未開放時三層都 403，這是伺服器權限，不繞。"""
+        3. upload blob + refer — 活動排程未開放（is_started=false）時仍回原檔，refer 參數由 refer_params 組
+        4. 預覽器的轉檔 PDF — document/{rid}/url?preview=true 回 {url}（Kcalb35 / fish-can 的做法）
+        refer 也 403 才是真權限鎖（exam 活動不帶 refer）。"""
         base = "https://courses.zju.edu.cn/api/uploads"
         codes = []
         for url, src in ((f"{base}/reference/{rid}/blob", "下載"), (f"{base}/{uid}/blob", "原檔")):
             r = self.get(url, stream=True)
             if r.ok:
                 return r, src
+            codes.append(r.status_code)
+            r.close()
+        refer = refer_params(activity)
+        if refer:
+            r = self.get(f"{base}/{uid}/blob", params=refer, stream=True)
+            if r.ok:
+                return r, "排程原檔"
             codes.append(r.status_code)
             r.close()
         r = self.get(f"{base}/reference/document/{rid}/url", params={"preview": "true"})
@@ -731,8 +752,8 @@ def cmd_sync(a):
     limit = a.max_size * 2**20 if a.max_size else None
 
     def fetch(job):
-        key, uid, rid, dest, _ = job
-        r, src = z.upload_response(uid, rid)
+        key, uid, rid, dest, a_ = job
+        r, src = z.upload_response(uid, rid, a_)
         return stream_to(r, dest, limit), src  # API 沒給 size 的檔，靠 Content-Length 把關
 
     # 多檔並行：單條連線常被伺服器限速，並行吃滿頻寬；manifest 只在主執行緒寫
@@ -751,7 +772,7 @@ def cmd_sync(a):
                 big.append(f"{dest0.parent.name}/{dest0.name}  {e}")
             except Exception as e:
                 if a_.get("is_started") is False and 403 in getattr(e, "codes", ()):
-                    # 老師排程開放：伺服器對所有端點都 403（不繞），開放後下次 sync 自動抓
+                    # 排程未開放且 refer 也 403（exam 不帶 refer 等）：開放後下次 sync 自動抓
                     pending.append(f"{dest0.parent.name}/{dest0.name}（{local_time(a_.get('start_time'))} 開放）")
                     continue
                 failed += 1
