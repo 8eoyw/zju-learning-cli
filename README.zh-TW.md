@@ -2,9 +2,9 @@
 
 [简体中文](README.md) | 繁體中文
 
-學在浙大（courses.zju.edu.cn）與智雲課堂（classroom.zju.edu.cn）的單檔命令列工具：同步課件、把智雲課堂的 PPT 截圖合併成 PDF、匯出課堂語音轉錄、查待辦。
+學在浙大（courses.zju.edu.cn）與智雲課堂（classroom.zju.edu.cn）的單檔命令列工具：同步課件、把智雲課堂的 PPT 截圖合併成 PDF（可去除重複截圖）、匯出課堂語音轉錄、查待辦。
 
-它是 [PeiPei233/zju-learning-assistant](https://github.com/PeiPei233/zju-learning-assistant)（ZLA）的 CLI 移植版。ZLA 是很好用的桌面 GUI，但沒辦法寫進腳本、排程或讓 AI agent 呼叫；這個專案把它的 API 邏輯改寫成一個 Python 檔，補上增量同步、並行下載，也修了幾個上游的邊界狀況。
+它是 [PeiPei233/zju-learning-assistant](https://github.com/PeiPei233/zju-learning-assistant)（ZLA）的 CLI 移植版。ZLA 是很好用的桌面 GUI，但沒辦法寫進腳本、排程或讓 AI agent 呼叫；這個專案把它的 API 邏輯改寫成一個 Python 檔，補上增量同步、並行下載、PPT 去重，也修了幾個上游的邊界狀況。
 
 ## 功能
 
@@ -30,7 +30,7 @@ ln -s "$PWD/zju-learning-cli/zju.py" ~/.local/bin/zju   # 或直接 ./zju.py
 zju login
 ```
 
-沒有 uv 的話：`pip install requests img2pdf pillow keyring`，再用 `python zju.py ...` 執行。
+沒有 uv 的話：`pip install requests img2pdf pillow keyring numpy`，再用 `python zju.py ...` 執行。
 
 ## 使用
 
