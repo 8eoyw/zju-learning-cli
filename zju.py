@@ -466,7 +466,8 @@ class Zju:
         page = 1
         while True:
             j = self.json(self.get("https://classroom.zju.edu.cn/pptnote/v1/schedule/search-ppt", params={
-                "course_id": course_id, "sub_id": sub_id, "page": page, "per_page": 100}), "search-ppt")
+                "course_id": course_id, "sub_id": sub_id, "page": page, "per_page": 100},
+                headers=self.bearer()), "search-ppt")
             total = int(j.get("total") or 0)
             added = 0
             for p in j.get("list") or []:
