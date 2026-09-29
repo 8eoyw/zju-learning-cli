@@ -14,6 +14,12 @@
 | `zju courses [--all]` | 课程列表（默认只列最新学年） |
 | `zju sync [课程...]` | 增量同步课件到 `<输出目录>/<课程>/` |
 | `zju todo` | 待办事项，依截止时间排序（本地时区） |
+| `zju activities [课程…] [--type forum homework …]` | 列出所有活动（课件、视频、作业、讨论、网页、链接、测验），附状态与截止时间 |
+| `zju show <活动id>` | 活动详情：说明、附件、完成条件；作业显示自己的提交状态，讨论显示帖数 |
+| `zju forum list <讨论id> [--mine] [--full]` / `forum read <topic>` | 列出讨论帖／读帖与回复 |
+| `zju forum post <讨论id> --title … --body …` / `forum reply <topic> --body …` | 发帖／回帖，可 `--body-file`、`--attach` 附件 |
+| `zju upload 文件…` | 上传文件到学在浙大，输出 upload id |
+| `zju submit <作业id> --file … [--body …] [--draft] [-y]` | 交作业；默认提交前确认，已截止会拦下 |
 | `zju classroom search 关键字` | 在智云课堂找课，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出该课每一堂的 `sub_id` |
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的课 |

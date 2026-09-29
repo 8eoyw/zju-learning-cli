@@ -15,6 +15,11 @@ API 邏輯移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py courses [--all]               # 學在浙大課程列表
   zju.py sync [課程...] [--dry-run]     # 增量同步課程附件（含排程中的活動）
   zju.py todo                          # 待辦
+  zju.py activities [課程...] [--type forum homework ...]  # 所有活動（含測驗）
+  zju.py show <活動id>                  # 活動詳情；作業顯示自己的提交狀態
+  zju.py forum list|read|post|reply ... # 討論區
+  zju.py upload 檔案...                 # 上傳，印 upload id
+  zju.py submit <作業id> --file ... [--body ...] [--draft] [-y]  # 交作業
   zju.py classroom search 關鍵字        # 智雲課堂找課（id 與學在浙大不同）
   zju.py classroom subs <cid>          # 列出每堂課
   zju.py classroom day [日期] [--days N]
@@ -25,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import html
 import json
 import os
 import random
@@ -51,6 +57,7 @@ COOKIE_FILE = STATE_DIR / "cookies.json"
 # 這兩台只支援 1024-bit DHE / 靜態 RSA，OpenSSL 3 預設拒絕；降級只套用在它們身上
 LEGACY_TLS_HOSTS = ("courses.zju.edu.cn", "identity.zju.edu.cn")
 CST = dt.timezone(dt.timedelta(hours=8))  # 學校 API 沒帶時區時視為北京時間
+LMS = "https://courses.zju.edu.cn"
 DEFAULT_OUT = Path.home() / "ZJU-Courses"  # 可用 config.json 的 "out" 或環境變數 ZJU_OUT 覆寫
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:88.0) Gecko/20100101 Firefox/88.0"
 MEDIA_EXT = {".mp4", ".mov", ".avi", ".mkv", ".flv", ".m4v", ".wmv", ".webm", ".mp3", ".m4a", ".wav"}
@@ -426,6 +433,106 @@ class Zju:
         self.ensure()
         return self.json(self.get("https://courses.zju.edu.cn/api/todos?no-intercept=true"), "todos").get("todo_list", [])
 
+    # ---- 活動 / 討論 / 作業提交（端點取自官方前端 JS）----
+
+    def user_id(self) -> int:
+        if not hasattr(self, "_uid"):
+            self.ensure()
+            m = re.search(r'ng-init="userId=(\d+);', self.get(f"{LMS}/user/index").text)
+            if not m:
+                raise ZjuError("抓不到自己的 user id（/user/index 改版？）")
+            self._uid = int(m.group(1))
+        return self._uid
+
+    def activities(self, course_id: int) -> list[dict]:
+        """課程所有活動（課件、影片、作業、討論、網頁、連結…）加上測驗。"""
+        self.ensure()
+        acts = self.json(self.get(f"{LMS}/api/courses/{course_id}/activities"), "activities").get("activities", [])
+        r = self.get(f"{LMS}/api/courses/{course_id}/exams")
+        if r.ok:
+            acts += [dict(e, type="exam") for e in self.json(r, "exams").get("exams", [])]
+        return acts
+
+    def activity(self, aid: int) -> dict:
+        self.ensure()
+        r = self.get(f"{LMS}/api/activities/{aid}")
+        if r.status_code == 404:
+            raise ZjuError(f"找不到活動 {aid}（測驗請用課程的 activities 看）")
+        return self.json(r, "activity")
+
+    def forum_category(self, aid: int) -> int:
+        """討論活動 id → 討論區分類 id（發帖、列帖都用分類 id）。"""
+        cid = self.activity(aid)["course_id"]
+        j = self.json(self.get(f"{LMS}/api/courses/{cid}/topic-categories"), "topic-categories")
+        for cat in j.get("topic_categories", []):
+            if cat.get("activity_id") == aid:
+                return cat["id"]
+        raise ZjuError(f"活動 {aid} 不是討論（或沒有討論區分類）")
+
+    def topics(self, category_id: int) -> list[dict]:
+        out, page = [], 1
+        while True:
+            j = self.json(self.get(f"{LMS}/api/forum/categories/{category_id}",
+                                   params={"page": page, "page_size": 50}), "forum")["result"]
+            out += j.get("topics", [])
+            if page >= (j.get("pages") or 1):
+                return out
+            page += 1
+
+    def topic(self, tid: int) -> dict:
+        self.ensure()
+        return self.json(self.get(f"{LMS}/api/topics/{tid}"), "topic")
+
+    def upload_file(self, path: Path) -> dict:
+        """兩段式：先登記取得 upload_url，再依 storage_type 送檔（學校目前是本地儲存 multipart PUT）。"""
+        self.ensure()
+        pre = self.json(self.post(f"{LMS}/api/uploads", json={
+            "name": path.name, "size": path.stat().st_size, "parent_type": None, "parent_id": 0,
+            "is_scorm": False, "is_wmpkg": False, "source": "", "is_marked_attachment": False,
+            "embed_material_type": "",
+        }), "uploads")
+        if "upload_url" not in pre:
+            raise ZjuError(f"上傳登記失敗：{pre}")
+        if pre.get("storage_type") in ("S3", "QINIU"):
+            raise ZjuError(f"儲存後端 {pre['storage_type']} 尚未支援（學校改了上傳方式）")
+        with path.open("rb") as f:
+            r = self.req("PUT", pre["upload_url"], files={"file": (path.name, f)}, retry=False,
+                         timeout=(6, 600))
+        if not r.ok:
+            raise ZjuError(f"上傳 {path.name} 失敗 HTTP {r.status_code}：{r.text[:200]}")
+        return pre
+
+    def create_topic(self, category_id: int, title: str, content: str, uploads: list[int]) -> dict:
+        r = self.post(f"{LMS}/api/topics", json={"title": title, "content": content,
+                                                  "category_id": category_id, "uploads": uploads})
+        if not r.ok:
+            raise ZjuError(f"發帖失敗 HTTP {r.status_code}：{r.text[:200]}")
+        return self.json(r, "topic")
+
+    def reply_topic(self, tid: int, content: str, uploads: list[int]) -> dict:
+        self.ensure()
+        r = self.post(f"{LMS}/api/topics/{tid}/replies", json={"content": content, "uploads": uploads})
+        if not r.ok:
+            raise ZjuError(f"回帖失敗 HTTP {r.status_code}：{r.text[:200]}")
+        return self.json(r, "reply")
+
+    def my_submission(self, aid: int) -> dict:
+        return self.json(self.get(f"{LMS}/api/course/activities/{aid}/students/{self.user_id()}/submission"),
+                         "submission")
+
+    def submit(self, aid: int, comment: str, uploads: list[int], draft: bool, mode: str,
+               draft_id: int | None) -> dict:
+        """與網頁「提交」相同的 payload；已有草稿時用 PUT 蓋掉草稿。"""
+        body = {"comment": comment, "uploads": uploads, "slides": [], "is_draft": draft, "mode": mode,
+                "other_resources": [], "uploads_in_rich_text": []}
+        method = "POST"
+        if draft_id:
+            method, body["submission_id"] = "PUT", draft_id
+        r = self.req(method, f"{LMS}/api/course/activities/{aid}/submissions", json=body)
+        if not r.ok:
+            raise ZjuError(f"提交失敗 HTTP {r.status_code}：{r.text[:300]}")
+        return self.json(r, "submission")
+
     # ---- 智雲課堂 ----
 
     def infosimple(self) -> dict:
@@ -600,6 +707,55 @@ def match_courses(courses: list[dict], keys: list[str], include_all: bool) -> li
                 out.append(c)
                 break
     return out
+
+
+ACT_TYPES = {
+    "material": "課件", "online_video": "影片", "homework": "作業", "forum": "討論", "exam": "測驗",
+    "page": "網頁", "web_link": "連結", "questionnaire": "問卷", "classroom": "課堂互動",
+    "lesson": "直播", "vocabulary": "單字", "survey": "調查", "chatroom": "聊天室",
+}
+
+
+def html_to_text(s: str | None) -> str:
+    s = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>", "\n", s or "")
+    s = html.unescape(re.sub(r"<[^>]+>", "", s))
+    return re.sub(r"\n{3,}", "\n\n", s).strip()
+
+
+def text_to_html(s: str) -> str:
+    """純文字 → 段落 HTML（空行分段、單換行 <br>），網頁編輯器存的也是這種格式。"""
+    paras = [p for p in re.split(r"\n\s*\n", s.strip()) if p.strip()]
+    return "".join("<p>" + html.escape(p.strip()).replace("\n", "<br>") + "</p>" for p in paras)
+
+
+def act_status(a: dict) -> str:
+    if a.get("is_closed"):
+        return "已關閉"
+    if a.get("is_started") is False:
+        return "未開始"
+    end = a.get("end_time")
+    if end and dt.datetime.fromisoformat(end.replace("Z", "+00:00")) < dt.datetime.now(dt.timezone.utc):
+        return "已截止"
+    return "進行中"
+
+
+def read_body(a) -> str:
+    """--body 文字或 --body-file 檔案（- = stdin）。"""
+    if a.body_file:
+        return sys.stdin.read() if a.body_file == "-" else Path(a.body_file).read_text(encoding="utf-8")
+    return a.body or ""
+
+
+def upload_all(z: "Zju", files: list[str] | None) -> list[int]:
+    ids = []
+    for f in files or []:
+        p = Path(f).expanduser()
+        if not p.is_file():
+            raise ZjuError(f"找不到檔案：{p}")
+        u = z.upload_file(p)
+        log(f"[上傳] {p.name} → upload {u['id']}")
+        ids.append(u["id"])
+    return ids
 
 
 def fmt_ts(sec: float, srt=True) -> str:
@@ -856,6 +1012,153 @@ def cmd_todo(a):
         print(f"{end}\t{t.get('course_name', '')}\t{t.get('title', '')}\t{t.get('type', '')}")
 
 
+def cmd_activities(a):
+    z = Zju()
+    courses = match_courses(z.courses(), a.course, a.all)
+    if not courses:
+        raise ZjuError("沒有符合的課程（用 courses --all 看 id）")
+    rows = []
+    for c in courses:
+        for x in z.activities(c["id"]):
+            if a.type and x.get("type") not in a.type:
+                continue
+            rows.append((c, x))
+    if a.json:
+        print(json.dumps([dict(x, course_name=c["name"]) for c, x in rows], ensure_ascii=False, indent=1))
+        return
+    for c, x in rows:
+        t = x.get("type", "")
+        end = local_time(x.get("end_time"), "%Y-%m-%d %H:%M") if x.get("end_time") else "-"
+        print(f"{x['id']}\t{c['name']}\t{ACT_TYPES.get(t, t)}\t{act_status(x)}\t{end}\t{x.get('title', '')}")
+
+
+def cmd_show(a):
+    z = Zju()
+    x = z.activity(a.activity)
+    t = x.get("type", "")
+    d = x.get("data") or {}
+    print(f"[{ACT_TYPES.get(t, t)}] {x.get('title')}  (id {x['id']}, 課程 {x.get('course_id')})")
+    print(f"狀態：{act_status(x)}　開始 {local_time(x.get('start_time'), '%Y-%m-%d %H:%M')}"
+          f"　截止 {local_time(x.get('end_time'), '%Y-%m-%d %H:%M') if x.get('end_time') else '無'}")
+    if x.get("completion_criterion"):
+        print(f"完成條件：{x['completion_criterion']}")
+    desc = html_to_text(d.get("description") or x.get("description"))
+    if desc:
+        print(f"\n{desc}\n")
+    for u in x.get("uploads") or []:
+        print(f"附件：{u.get('name')}  (upload {u.get('id')})")
+    if t == "web_link" and d.get("link"):
+        print(f"連結：{d['link']}")
+    if t == "homework":
+        s = z.my_submission(x["id"])
+        if s.get("created_at"):
+            kind = "草稿" if s.get("is_draft") else "已提交"
+            print(f"我的提交：{kind} {local_time(s.get('created_at'), '%Y-%m-%d %H:%M')}"
+                  f"　分數 {s.get('score') if s.get('score') is not None else '未評'}")
+            for u in s.get("uploads") or []:
+                print(f"  - {u.get('name')}")
+            if s.get("comment"):
+                print("  " + html_to_text(s["comment"]).replace("\n", "\n  "))
+        else:
+            print("我的提交：尚未提交")
+    elif t == "forum":
+        ts = z.topics(z.forum_category(x["id"]))
+        print(f"討論帖 {len(ts)} 則（forum list {x['id']} 看全部）")
+
+
+def cmd_forum(a):
+    z = Zju()
+    if a.action == "list":
+        uid = z.user_id() if a.mine else None
+        for t in z.topics(z.forum_category(a.id)):
+            by = t.get("created_by") or {}
+            if uid and by.get("id") != uid:
+                continue
+            print(f"{t['id']}\t{local_time(t.get('created_at'))}\t{by.get('name', '')}\t"
+                  f"回覆 {t.get('reply_count', 0)}\t{t.get('title', '')}")
+            if a.full:
+                print("  " + html_to_text(t.get("content")).replace("\n", "\n  "))
+    elif a.action == "read":
+        t = z.topic(a.id)
+        by = t.get("created_by") or {}
+        print(f"# {t.get('title')}\n{by.get('name', '')}  {local_time(t.get('created_at'), '%Y-%m-%d %H:%M')}\n")
+        print(html_to_text(t.get("content")))
+        for u in t.get("uploads") or []:
+            print(f"附件：{u.get('name')}")
+
+        def show(rs, depth):
+            for r in rs or []:
+                rb = r.get("created_by") or {}
+                pad = "  " * depth
+                print(f"\n{pad}↳ {rb.get('name', '')}  {local_time(r.get('created_at'))}")
+                print(pad + html_to_text(r.get("content")).replace("\n", "\n" + pad))
+                show(r.get("replies"), depth + 1)
+        show(t.get("replies"), 1)
+    else:
+        body = read_body(a)
+        if not body.strip():
+            raise ZjuError("內容是空的：用 --body 或 --body-file")
+        content = body if a.html else text_to_html(body)
+        if a.action == "post":
+            if not a.title:
+                raise ZjuError("發帖要 --title")
+            cat = z.forum_category(a.id)
+            ids = upload_all(z, a.attach)
+            t = z.create_topic(cat, a.title, content, ids)
+            print(f"[已發帖] topic {t['id']}：{t.get('title')}")
+        else:
+            ids = upload_all(z, a.attach)
+            r = z.reply_topic(a.id, content, ids)
+            print(f"[已回帖] reply {r.get('id')} → topic {a.id}")
+
+
+def cmd_upload(a):
+    z = Zju()
+    for f in a.files:
+        p = Path(f).expanduser()
+        if not p.is_file():
+            raise ZjuError(f"找不到檔案：{p}")
+        u = z.upload_file(p)
+        print(f"{u['id']}\t{p.name}")
+
+
+def cmd_submit(a):
+    z = Zju()
+    x = z.activity(a.activity)
+    if x.get("type") != "homework":
+        raise ZjuError(f"活動 {a.activity} 是 {x.get('type')}，不是作業")
+    status = act_status(x)
+    if status != "進行中" and not x.get("is_resubmit_open"):
+        raise ZjuError(f"作業「{x.get('title')}」{status}，網頁上也交不了")
+    comment = read_body(a)
+    if not comment.strip() and not a.file and not a.upload_id:
+        raise ZjuError("沒有東西可交：給 --file、--upload-id 或 --body")
+    prev = z.my_submission(x["id"])
+    draft_id = prev.get("id") if prev.get("is_draft") else None
+    kind = "存草稿" if a.draft else "正式提交"
+    print(f"{kind}「{x.get('title')}」（截止 {local_time(x.get('end_time'), '%Y-%m-%d %H:%M')}）")
+    for f in a.file or []:
+        print(f"  檔案：{f}")
+    if comment.strip():
+        print(f"  文字：{comment.strip()[:80]}{'…' if len(comment.strip()) > 80 else ''}")
+    if prev.get("created_at") and not prev.get("is_draft"):
+        print("  注意：已經交過一次，這次會新增一份提交")
+    if not a.yes:
+        if not sys.stdin.isatty():
+            raise ZjuError("非互動環境要加 --yes 才會真的送出")
+        try:
+            ok = input("確定送出？[y/N] ").strip().lower() == "y"
+        except EOFError:  # Windows 的 NUL 也算 tty，讀不到就當取消
+            ok = False
+        if not ok:
+            log("已取消（非互動環境加 --yes）")
+            return
+    ids = upload_all(z, a.file) + (a.upload_id or [])
+    content = comment if a.html else text_to_html(comment) if comment.strip() else ""
+    s = z.submit(x["id"], content, ids, a.draft, (x.get("data") or {}).get("mode") or "normal", draft_id)
+    print(f"[{kind}] submission {s.get('id', '')} ✓")
+
+
 def cmd_classroom(a):
     z = Zju()
     if a.action == "search":
@@ -985,6 +1288,55 @@ def main():
     x = sp.add_parser("todo", help="待辦事項")
     x.add_argument("--json", action="store_true")
     x.set_defaults(fn=cmd_todo)
+
+    x = sp.add_parser("activities", help="列出課程活動（課件／影片／作業／討論／測驗…）")
+    x.add_argument("course", nargs="*", help="課程 id 或名稱片段；省略 = 最新學年所有課程")
+    x.add_argument("--all", action="store_true", help="沒指定課程時含往年課程")
+    x.add_argument("--type", nargs="*", metavar="T", help=f"只列這些類型：{', '.join(ACT_TYPES)}")
+    x.add_argument("--json", action="store_true")
+    x.set_defaults(fn=cmd_activities)
+
+    x = sp.add_parser("show", help="單一活動詳情（說明、附件、作業提交狀態、討論帖數）")
+    x.add_argument("activity", type=int)
+    x.set_defaults(fn=cmd_show)
+
+    def body_args(x):
+        x.add_argument("--body", help="內容（純文字，空行分段）")
+        x.add_argument("--body-file", help="從檔案讀內容；- = stdin")
+        x.add_argument("--html", action="store_true", help="內容已經是 HTML，不轉換")
+        x.add_argument("--attach", nargs="*", metavar="FILE", help="附件")
+
+    x = sp.add_parser("forum", help="討論區：list / read / post / reply")
+    fp = x.add_subparsers(dest="action", required=True)
+    y = fp.add_parser("list", help="列出討論帖（給討論活動 id）")
+    y.add_argument("id", type=int, help="討論活動 id（activities --type forum 查）")
+    y.add_argument("--mine", action="store_true", help="只看自己發的")
+    y.add_argument("--full", action="store_true", help="連內文一起印")
+    y = fp.add_parser("read", help="讀一則帖子與回覆")
+    y.add_argument("id", type=int, help="topic id")
+    y = fp.add_parser("post", help="發新帖")
+    y.add_argument("id", type=int, help="討論活動 id")
+    y.add_argument("--title", required=True)
+    body_args(y)
+    y = fp.add_parser("reply", help="回帖")
+    y.add_argument("id", type=int, help="topic id")
+    body_args(y)
+    x.set_defaults(fn=cmd_forum)
+
+    x = sp.add_parser("upload", help="上傳檔案到學在浙大，印出 upload id")
+    x.add_argument("files", nargs="+")
+    x.set_defaults(fn=cmd_upload)
+
+    x = sp.add_parser("submit", help="交作業（附檔＋文字），預設送出前確認")
+    x.add_argument("activity", type=int, help="作業活動 id（activities --type homework 查）")
+    x.add_argument("--file", nargs="*", metavar="FILE", help="要交的檔案")
+    x.add_argument("--upload-id", type=int, nargs="*", help="已用 upload 指令傳好的檔案 id")
+    x.add_argument("--body", help="作業文字內容")
+    x.add_argument("--body-file", help="從檔案讀作業文字；- = stdin")
+    x.add_argument("--html", action="store_true", help="文字已經是 HTML")
+    x.add_argument("--draft", action="store_true", help="只存草稿不正式提交")
+    x.add_argument("-y", "--yes", action="store_true", help="不確認直接送出")
+    x.set_defaults(fn=cmd_submit)
 
     x = sp.add_parser("classroom", help="智雲課堂：search / subs / day")
     x.add_argument("action", choices=["search", "subs", "day"])
