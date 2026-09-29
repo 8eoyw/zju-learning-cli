@@ -123,6 +123,70 @@ class Offline(unittest.TestCase):
             z.s.get("https://courses.zju.edu.cn/api/x")
             self.assertIn("SECRET", seen["headers"].get("Cookie", ""))
 
+    def test_refer_params(self):
+        # 與前端 getDownloadRefer 同規則：classroom→classroom_activity、exam 不帶、其餘→learning_activity
+        self.assertEqual(zju.refer_params({"id": 1164596, "type": "online_video"}),
+                         {"refer_id": 1164596, "refer_type": "learning_activity"})
+        self.assertEqual(zju.refer_params({"id": 1159399, "type": "material"}),
+                         {"refer_id": 1159399, "refer_type": "learning_activity"})
+        self.assertEqual(zju.refer_params({"id": 7, "type": "classroom"}),
+                         {"refer_id": 7, "refer_type": "classroom_activity"})
+        self.assertIsNone(zju.refer_params({"id": 7, "type": "exam"}))
+        self.assertIsNone(zju.refer_params({"type": "material"}))  # 缺 id
+        self.assertIsNone(zju.refer_params(None))
+
+    def test_upload_response_refer_fallback(self):
+        """排程未開放：前兩層 403、第 3 層帶 snake_case refer 回原檔，不再落到 preview PDF。"""
+        import io
+        import requests
+        from unittest import mock
+
+        calls = []
+
+        def fake_get(self_, url, **kw):
+            calls.append((url, kw.get("params")))
+            ok = bool((kw.get("params") or {}).get("refer_id"))
+            r = requests.Response()
+            r.raw = io.BytesIO(b"x" * 10 if ok else b"")
+            r.status_code = 200 if ok else 403
+            r.headers["Content-Type"] = "application/octet-stream"
+            if ok:
+                r.headers["Content-Length"] = "10"
+            return r
+
+        z = zju.Zju.__new__(zju.Zju)
+        with mock.patch.object(zju.Zju, "get", fake_get):
+            r, src = z.upload_response(2316787, 17939358, {"id": 1164596, "type": "online_video"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(src, "排程原檔")
+        self.assertEqual(len(calls), 3)  # refer 成功就不需要 preview PDF
+        self.assertTrue(calls[0][0].endswith("/reference/17939358/blob"))
+        self.assertEqual(calls[2], ("https://courses.zju.edu.cn/api/uploads/2316787/blob",
+                                    {"refer_id": 1164596, "refer_type": "learning_activity"}))
+
+    def test_upload_response_no_refer_for_exam(self):
+        """exam 活動不帶 refer：只走原三層，exam 未開放時照樣 403 拋錯。"""
+        import io
+        import requests
+        from unittest import mock
+
+        calls = []
+
+        def fake_get(self_, url, **kw):
+            calls.append((url, kw.get("params")))
+            r = requests.Response()
+            r.raw = io.BytesIO(b"")
+            r.status_code = 403
+            return r
+
+        z = zju.Zju.__new__(zju.Zju)
+        with mock.patch.object(zju.Zju, "get", fake_get):
+            with self.assertRaises(zju.DownloadError) as cm:
+                z.upload_response(1, 2, {"id": 9, "type": "exam"})
+        self.assertEqual(len(calls), 3)  # reference blob、uid blob、preview url（沒有 refer 層）
+        self.assertTrue(all("refer_id" not in (p or {}) for _, p in calls))
+        self.assertEqual(cm.exception.codes, [403, 403, 403])
+
     def test_stream_to_rejects_truncated(self):
         import io
         import requests

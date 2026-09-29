@@ -14,6 +14,12 @@
 | `zju courses [--all]` | 课程列表（默认只列最新学年） |
 | `zju sync [课程...]` | 增量同步课件到 `<输出目录>/<课程>/` |
 | `zju todo` | 待办事项，依截止时间排序（本地时区） |
+| `zju activities [课程…] [--type forum homework …]` | 列出所有活动（课件、视频、作业、讨论、网页、链接、测验），附状态与截止时间 |
+| `zju show <活动id>` | 活动详情：说明、附件、完成条件；作业显示自己的提交状态，讨论显示帖数 |
+| `zju forum list <讨论id> [--mine] [--full]` / `forum read <topic>` | 列出讨论帖／读帖与回复 |
+| `zju forum post <讨论id> --title … --body …` / `forum reply <topic> --body …` | 发帖／回帖，可 `--body-file`、`--attach` 附件 |
+| `zju upload 文件…` | 上传文件到学在浙大，输出 upload id |
+| `zju submit <作业id> --file … [--body …] [--draft] [-y]` | 交作业；默认提交前确认，已截止会拦下 |
 | `zju classroom search 关键字` | 在智云课堂找课，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出该课每一堂的 `sub_id` |
 | `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的课 |
@@ -80,15 +86,16 @@ zju transcript --days 1 --format md
 - `courses.zju.edu.cn` 与 `identity.zju.edu.cn` 只支持 1024-bit DHE／静态 RSA，OpenSSL 3 默认拒绝连接（`DH_KEY_TOO_SMALL`）。`SECLEVEL=1` 只套用在这两台，其他主机维持默认的 TLS 设置。
 - 智云的 `_token` cookie 设在 `.zju.edu.cn` 父网域，而不是 `classroom.zju.edu.cn`。
 
-## 关闭下载的课件
+## 附件下载来源
 
-老师关闭下载时，依序尝试三条路：
+`sync` 对每个附件依优先序尝试以下来源，采用第一个能回档的：
 
-1. `/api/uploads/reference/{rid}/blob`：正常下载
-2. `/api/uploads/{id}/blob`：多数情况仍然拿得到原格式（ZLA、[eWloYW8/ZJU-course-material-download](https://github.com/eWloYW8/ZJU-course-material-download)、[xzzd-pro](https://github.com/xzzd-pro/xzzd-pro) 用的方式）
-3. `/api/uploads/reference/document/{rid}/url?preview=true`：预览器转出来的 PDF（[Kcalb35/Tronclass-pdf-downloaderforChrome](https://github.com/Kcalb35/Tronclass-pdf-downloaderforChrome)、[fish-can/TronClass-PDF-Downloader](https://github.com/fish-can/TronClass-PDF-Downloader) 用的方式）
+1. `/api/uploads/reference/{rid}/blob`：常规下载
+2. `/api/uploads/{id}/blob`：原始文件
+3. `/api/uploads/{id}/blob?refer_id={活动id}&refer_type=learning_activity`：reference 参数与官方网页前端下载钮送出的相同（`classroom` 活动用 `classroom_activity`、考试不带）；部分活动的附件只有此来源提供，来源标记 `排程原档`
+4. `/api/uploads/reference/document/{rid}/url?preview=true`：预览器转出的 PDF（[Kcalb35/Tronclass-pdf-downloaderforChrome](https://github.com/Kcalb35/Tronclass-pdf-downloaderforChrome)、[fish-can/TronClass-PDF-Downloader](https://github.com/fish-can/TronClass-PDF-Downloader) 采用的方式）
 
-**老师排定之后才开放的活动**，服务器对以上所有端点都会回 403。这是权限控制，本工具不会尝试绕过：这类文件会标成 `[未开放]（开放时间）`，不算失败，开放后下次 `sync` 会自动抓。
+**排程尚未开放的活动**（`is_started=false`）通常由来源 3 照常下载；若所有来源都回 403，该文件标记 `[未开放]（开放时间）`，不算失败，开放后下次 `sync` 会自动抓。
 
 ## 安全性
 
