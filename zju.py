@@ -310,8 +310,11 @@ class Zju:
             raise ZjuError("登入失敗：學號或密碼錯誤（或需要驗證碼，先在瀏覽器登入一次）")
         # 讓各子系統吃到 SSO
         self.get("https://courses.zju.edu.cn/user/courses")
-        self.get("https://tgmedia.cmc.zju.edu.cn/index.php?r=auth/login&auType=cmc&tenant_code=112"
-                 "&forward=https%3A%2F%2Fclassroom.zju.edu.cn%2F")
+        try:
+            self.get("https://tgmedia.cmc.zju.edu.cn/index.php?r=auth/login&auType=cmc&tenant_code=112"
+                     "&forward=https%3A%2F%2Fclassroom.zju.edu.cn%2F")
+        except ZjuError as e:
+            log(f"警告：智雲 SSO 連不上（只影響 classroom/ppt/transcript）：{str(e).splitlines()[0]}")
         self.logged_in = True
         self.save_cookies()
 
