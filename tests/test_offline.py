@@ -215,5 +215,64 @@ class Offline(unittest.TestCase):
             self.assertEqual(out.name, "e.pptx.pdf")
 
 
+    def test_in_class(self):
+        # 北京時間 2026-10-08 13:25–15:50 一堂（主機時區不影響）
+        b = int(zju.dt.datetime(2026, 10, 8, 13, 25, tzinfo=zju.CST).timestamp())
+        subs = [{"sub_id": 1, "begin": b, "over": b + 145 * 60}, {"sub_id": 2, "begin": 0, "over": 0}]
+        self.assertEqual(zju.class_span(subs[0]), "13:25-15:50")
+        self.assertEqual(zju.class_span(subs[1]), "-")
+        self.assertEqual([s["sub_id"] for s in zju.in_class(subs, b - 5 * 60)], [1])  # 上課前 5 分
+        self.assertEqual(zju.in_class(subs, b - 11 * 60), [])
+        self.assertEqual([s["sub_id"] for s in zju.in_class(subs, b + 150 * 60)], [1])  # 下課後 5 分
+        self.assertEqual(zju.in_class(subs, b + 150 * 60, margin=0), [])
+
+    def test_day_subs_times(self):
+        from unittest import mock
+        import requests
+        r = requests.Response()
+        r.status_code = 200
+        r._content = ('{"list":{"0":{"course":[{"id":"86830","title":"NLP","sub_id":"1976778",'
+                      '"sub_title":"第9-10节","realname":"T","course_begin":"1791447300",'
+                      '"course_over":"1791453000"}]}}}').encode()
+        z = zju.Zju.__new__(zju.Zju)
+        z.logged_in = True
+        with mock.patch.object(zju.Zju, "get", lambda *a, **kw: r), \
+                mock.patch.object(zju.Zju, "bearer", lambda self_: {}):
+            s, = z.day_subs(zju.dt.date(2026, 10, 8))
+        self.assertEqual((s["begin"], s["over"]), (1791447300, 1791453000))
+        self.assertEqual(zju.class_span(s), "16:15-17:50")
+
+    def test_rollcall_in_class_skips_api(self):
+        """不在上課時段：不打簽到 API；簽到只用 GET 列表，不送任何簽到請求。"""
+        import argparse
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        z = zju.Zju.__new__(zju.Zju)
+        z.logged_in = True
+        a = argparse.Namespace(in_class=True, margin=10, json=True)
+        with mock.patch.object(zju, "Zju", return_value=z), \
+                mock.patch.object(zju, "today_subs", return_value=[]), \
+                mock.patch.object(z, "req") as req, redirect_stdout(io.StringIO()) as out:
+            zju.cmd_rollcall(a)
+        req.assert_not_called()
+        self.assertEqual(out.getvalue(), "[]\n")
+
+        import requests
+        r = requests.Response()
+        r.status_code = 200
+        r._content = ('{"rollcalls":[{"rollcall_id":9,"course_title":"NLP","is_number":true,'
+                      '"is_radar":false,"status":"absent","created_by_name":"T"}]}').encode()
+        a.in_class = a.json = False
+        with mock.patch.object(zju, "Zju", return_value=z), \
+                mock.patch.object(z, "req", return_value=r) as req, redirect_stdout(io.StringIO()) as out:
+            zju.cmd_rollcall(a)
+        self.assertEqual([c.args[0] for c in req.call_args_list], ["GET"])
+        self.assertEqual(out.getvalue(), "9\tNLP\t數字\t未簽\tT\n")
+
+    def test_today_cst(self):
+        import datetime as dt
+        self.assertEqual(zju.today_cst(), dt.datetime.now(zju.CST).date())
+
 if __name__ == "__main__":
     unittest.main()

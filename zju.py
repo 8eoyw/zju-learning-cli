@@ -23,6 +23,7 @@ API 邏輯移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py classroom search 關鍵字        # 智雲課堂找課（id 與學在浙大不同）
   zju.py classroom subs <cid>          # 列出每堂課
   zju.py classroom day [日期] [--days N]
+  zju.py rollcall [--in-class] [--json]  # 簽到提醒用：只列出進行中的簽到，不代簽
   zju.py ppt --course <cid> | --days N [--dedup]  # 智雲 PPT 截圖合併 PDF
   zju.py transcript --course <cid> | --days N [--format txt|srt|md]
 """
@@ -54,6 +55,7 @@ KEYCHAIN_SERVICE = "zju-learning"
 STATE_DIR = Path(os.environ.get("ZJU_STATE_DIR") or (Path.home() / ".config" / "zju-learning"))
 CONFIG_FILE = STATE_DIR / "config.json"
 COOKIE_FILE = STATE_DIR / "cookies.json"
+SCHEDULE_FILE = STATE_DIR / "schedule.json"  # rollcall --in-class 的當日課表快取
 # 這兩台只支援 1024-bit DHE / 靜態 RSA，OpenSSL 3 預設拒絕；降級只套用在它們身上
 LEGACY_TLS_HOSTS = ("courses.zju.edu.cn", "identity.zju.edu.cn")
 CST = dt.timezone(dt.timedelta(hours=8))  # 學校 API 沒帶時區時視為北京時間
@@ -436,6 +438,12 @@ class Zju:
         self.ensure()
         return self.json(self.get("https://courses.zju.edu.cn/api/todos?no-intercept=true"), "todos").get("todo_list", [])
 
+    def rollcalls(self) -> list[dict]:
+        """進行中的簽到（欄位同 XMU-Rollcall-Bot）。只讀列表：不碰 answer / student_rollcalls。"""
+        self.ensure()
+        return self.json(self.get(f"{LMS}/api/radar/rollcalls", params={"api_version": "1.1.0"}),
+                         "rollcalls").get("rollcalls", [])
+
     # ---- 活動 / 討論 / 作業提交（端點取自官方前端 JS）----
 
     def user_id(self) -> int:
@@ -585,7 +593,8 @@ class Zju:
         for d in (lst.values() if isinstance(lst, dict) else lst or []):
             for c in d.get("course", []):
                 subs.append({"course_id": int(c["id"]), "course_name": c["title"], "sub_id": int(c["sub_id"]),
-                             "sub_name": c["sub_title"], "lecturer": c.get("realname", "")})
+                             "sub_name": c["sub_title"], "lecturer": c.get("realname", ""),
+                             "begin": int(c.get("course_begin") or 0), "over": int(c.get("course_over") or 0)})
         return subs
 
     def ppt_urls(self, course_id: int, sub_id: int) -> list[str]:
@@ -686,6 +695,28 @@ def current_year(courses: list[dict]) -> list[dict]:
     """is_closed 學校常不關，靠 academic_year_id 取最新學年。"""
     latest = max((c.get("academic_year_id") or 0 for c in courses), default=0)
     return [c for c in courses if (c.get("academic_year_id") or 0) == latest and not c.get("is_closed")]
+
+
+def today_cst() -> dt.date:
+    """課表以北京時間分日；主機在別的時區時 dt.date.today() 會差一天。"""
+    return dt.datetime.now(CST).date()
+
+
+def class_span(s: dict) -> str:
+    if not s.get("begin"):
+        return "-"
+    f = lambda t: dt.datetime.fromtimestamp(t, CST).strftime("%H:%M")
+    return f"{f(s['begin'])}-{f(s['over'])}"
+
+
+def in_class(subs: list[dict], now: float, margin: int = 10) -> list[dict]:
+    """now（Unix 秒）落在 [上課 - margin 分, 下課 + margin 分] 的課堂。"""
+    m = margin * 60
+    return [s for s in subs if s.get("begin") and s["begin"] - m <= now <= s["over"] + m]
+
+
+def rollcall_kind(r: dict) -> str:
+    return "雷達" if r.get("is_radar") else "數字" if r.get("is_number") else "點名"
 
 
 def local_time(iso: str | None, fmt: str = "%m-%d %H:%M") -> str:
@@ -873,7 +904,7 @@ def resolve_subs(z: Zju, a) -> list[dict]:
             subs = [s for s in subs if s["sub_id"] in a.sub]
         return subs
     days = a.days or 1
-    today = dt.date.today()
+    today = today_cst()
     subs = []
     for i in range(days):
         subs += z.day_subs(today - dt.timedelta(days=i))
@@ -1173,11 +1204,49 @@ def cmd_classroom(a):
         for s in z.course_subs(int(a.arg)):
             print(f"{s['sub_id']}\t{s['sub_name']}\t{s['lecturer']}")
     elif a.action == "day":
-        start = dt.date.fromisoformat(a.arg) if a.arg else dt.date.today()
+        start = dt.date.fromisoformat(a.arg) if a.arg else today_cst()
         for i in range(a.days or 1):
             d = start - dt.timedelta(days=i)
             for s in z.day_subs(d):
-                print(f"{d}\t{s['course_id']}\t{s['sub_id']}\t{s['course_name']}\t{s['sub_name']}\t{s['lecturer']}")
+                print(f"{d}\t{s['course_id']}\t{s['sub_id']}\t{s['course_name']}\t{s['sub_name']}\t{s['lecturer']}"
+                      f"\t{class_span(s)}")
+
+
+def today_subs(z: Zju) -> list[dict]:
+    """當日課表一天只抓一次（排程每幾分鐘跑一次，別每次都打智雲）。"""
+    today = today_cst().isoformat()
+    try:
+        cache = json.loads(SCHEDULE_FILE.read_text())
+        if cache.get("day") == today:
+            return cache["subs"]
+    except (OSError, ValueError, KeyError):
+        pass
+    subs = z.day_subs(today_cst())
+    state_dir()
+    SCHEDULE_FILE.write_text(json.dumps({"day": today, "subs": subs}, ensure_ascii=False))
+    return subs
+
+
+def cmd_rollcall(a):
+    z = Zju()
+    if a.in_class:
+        now_subs = in_class(today_subs(z), time.time(), a.margin)
+        if not now_subs:
+            log("現在不是上課時段，略過")
+            if a.json:
+                print("[]")
+            return
+        log("上課中：" + "、".join(f"{s['course_name']} {class_span(s)}" for s in now_subs))
+    rs = z.rollcalls()
+    if a.json:
+        print(json.dumps(rs, ensure_ascii=False, indent=1))
+        return
+    if not rs:
+        log("沒有進行中的簽到")
+    for r in rs:
+        signed = "已簽" if r.get("status") == "on_call_fine" else "未簽"
+        print(f"{r.get('rollcall_id')}\t{r.get('course_title', '')}\t{rollcall_kind(r)}\t{signed}"
+              f"\t{r.get('created_by_name', '')}")
 
 
 def cmd_ppt(a):
@@ -1347,6 +1416,12 @@ def main():
     x.add_argument("--teacher")
     x.add_argument("--days", type=int)
     x.set_defaults(fn=cmd_classroom)
+
+    x = sp.add_parser("rollcall", help="進行中的簽到（只查看、不代簽）")
+    x.add_argument("--in-class", action="store_true", help="只在今天課表的上課時段才查（給排程用）")
+    x.add_argument("--margin", type=int, default=10, metavar="MIN", help="上課前後各放寬幾分鐘（預設 10）")
+    x.add_argument("--json", action="store_true")
+    x.set_defaults(fn=cmd_rollcall)
 
     for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript)):
         x = sp.add_parser(name, help="智雲 PPT → PDF" if name == "ppt" else "智雲課堂語音轉錄")
