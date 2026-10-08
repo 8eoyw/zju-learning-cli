@@ -720,8 +720,16 @@ ACT_TYPES = {
 
 
 def html_to_text(s: str | None) -> str:
-    s = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>", "\n", s or "")
+    def link(m):  # 連結文字 ≠ 網址時兩個都留；網址前後補空白，免得黏在中文上
+        href, text = html.unescape(m.group(1)), re.sub(r"<[^>]+>", "", m.group(2)).strip()
+        return f" {href} " if not text or html.unescape(text) == href else f"{text} ({href})"
+    s = re.sub(r"(?is)<a\b[^>]*?href=\"([^\"]+)\"[^>]*>(.*?)</a>", link, s or "")
+    s = re.sub(r"(?i)<img\b[^>]*?src=\"([^\"]+)\"[^>]*>", lambda m: f"[圖 {urljoin(LMS, html.unescape(m.group(1)))}]", s)
+    s = re.sub(r"(?i)<li\b[^>]*>", "- ", s)
+    s = re.sub(r"(?i)</t[dh]>", "\t", s)
+    s = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>|</tr>|</h\d>", "\n", s)
     s = html.unescape(re.sub(r"<[^>]+>", "", s))
+    s = re.sub(r"[ \t]+\n", "\n", re.sub(r"(?m)^- +", "- ", s))
     return re.sub(r"\n{3,}", "\n\n", s).strip()
 
 
