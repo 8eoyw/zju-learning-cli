@@ -22,7 +22,9 @@
 | `zju submit <作業id> --file … [--body …] [--draft] [-y]` | 交作業；預設送出前確認，已截止會擋下 |
 | `zju classroom search 關鍵字` | 在智雲課堂找課，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出該課每一堂的 `sub_id` |
-| `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的課 |
+| `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的課，含追蹤中的課 |
+| `zju classroom add\|rm <course_id>...` | 追蹤課表外的課（申請聽課核准的）。智雲的課表 API 只回自己選的班，追蹤後 `classroom day`、`ppt --days`、`transcript --days` 都會帶上，輸出資料夾為「課名 老師」避免和自己那班撞名 |
+| `zju classroom tracked` | 列出追蹤中的課 |
 | `zju ppt --course <id> \| --days N [--dedup]` | 智雲 PPT 截圖 → `<課程>/智雲PPT/<堂>.pdf` |
 | `zju transcript --course <id> \| --days N` | 語音轉錄 → `<課程>/轉錄/<堂>.txt\|srt\|md` |
 

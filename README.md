@@ -22,7 +22,9 @@
 | `zju submit <作业id> --file … [--body …] [--draft] [-y]` | 交作业；默认提交前确认，已截止会拦下 |
 | `zju classroom search 关键字` | 在智云课堂找课，取得 `course_id` |
 | `zju classroom subs <course_id>` | 列出该课每一堂的 `sub_id` |
-| `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的课 |
+| `zju classroom day [日期] [--days N]` | 某天（或最近 N 天）自己的课，含追踪中的课 |
+| `zju classroom add\|rm <course_id>...` | 追踪课表外的课（申请听课核准的）。智云的课表 API 只回自己选的班，追踪后 `classroom day`、`ppt --days`、`transcript --days` 都会带上，输出文件夹为「课名 老师」避免和自己那班撞名 |
+| `zju classroom tracked` | 列出追踪中的课 |
 | `zju ppt --course <id> \| --days N [--dedup]` | 智云 PPT 截图 → `<课程>/智云PPT/<堂>.pdf` |
 | `zju transcript --course <id> \| --days N` | 语音转录 → `<课程>/转录/<堂>.txt\|srt\|md` |
 

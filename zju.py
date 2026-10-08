@@ -22,7 +22,9 @@ API 邏輯移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py submit <作業id> --file ... [--body ...] [--draft] [-y]  # 交作業
   zju.py classroom search 關鍵字        # 智雲課堂找課（id 與學在浙大不同）
   zju.py classroom subs <cid>          # 列出每堂課
-  zju.py classroom day [日期] [--days N]
+  zju.py classroom day [日期] [--days N]   # 課表的課＋追蹤中的旁聽課
+  zju.py classroom add|rm <cid>...      # 追蹤課表外的課（申請聽課核准的），--days 也會抓
+  zju.py classroom tracked             # 列出追蹤中的課
   zju.py ppt --course <cid> | --days N [--dedup]  # 智雲 PPT 截圖合併 PDF
   zju.py transcript --course <cid> | --days N [--format txt|srt|md]
 """
@@ -570,9 +572,11 @@ class Zju:
             for month in year.values():
                 for week in month.values():
                     for s in week:
+                        begin = int(s.get("class_begin") or 0)
                         subs.append({"course_id": course_id, "course_name": data["title"],
                                      "sub_id": int(s["id"]), "sub_name": s["sub_title"],
-                                     "lecturer": s.get("lecturer_name", "")})
+                                     "lecturer": s.get("lecturer_name", ""),
+                                     "day": dt.date.fromtimestamp(begin) if begin else None})
         subs.sort(key=lambda s: s["sub_name"])
         return subs
 
@@ -916,18 +920,47 @@ def dedup_slides(paths: list[Path], max_lost_cells: int = 2) -> list[Path]:
     return [paths[k] for k in keep] or list(paths)
 
 
+def tracked_courses() -> dict[str, str]:
+    """config.json 的 tracked_courses：{智雲 course_id: 顯示名}。
+    申請聽課核准的課不在 get-my-course-day（只回課表），智雲也沒有「我的申請」清單 API，只能自己記。"""
+    return load_config().get("tracked_courses") or {}
+
+
+def range_subs(z: Zju, end: dt.date, days: int) -> list[tuple[dt.date, dict]]:
+    """end 往前 days 天：課表的課＋追蹤課程當天的堂次，依 sub_id 去重。"""
+    out, seen = [], set()
+    for i in range(days):
+        d = end - dt.timedelta(days=i)
+        for s in z.day_subs(d):
+            if s["sub_id"] not in seen:
+                seen.add(s["sub_id"])
+                out.append((d, s))
+    start = end - dt.timedelta(days=days - 1)
+    for cid, name in tracked_courses().items():
+        try:
+            subs = z.course_subs(int(cid))
+        except Exception as e:  # 一門壞掉不拖垮課表的課
+            log(f"[失敗] 追蹤課程 {cid} {name}: {e}")
+            continue
+        for s in subs:
+            if s["day"] and start <= s["day"] <= end and s["sub_id"] not in seen:
+                seen.add(s["sub_id"])
+                # 旁聽課常和自己那班同名同節次（別的老師開的同一門），不改名會寫進同一個資料夾而被當成已存在略過
+                out.append((s["day"], {**s, "course_name": name}))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
+
+
 def resolve_subs(z: Zju, a) -> list[dict]:
     if a.course:
         subs = z.course_subs(a.course)
+        name = tracked_courses().get(str(a.course))
+        if name:
+            subs = [{**s, "course_name": name} for s in subs]
         if a.sub:
             subs = [s for s in subs if s["sub_id"] in a.sub]
         return subs
-    days = a.days or 1
-    today = dt.date.today()
-    subs = []
-    for i in range(days):
-        subs += z.day_subs(today - dt.timedelta(days=i))
-    return subs
+    return [s for _, s in range_subs(z, dt.date.today(), a.days or 1)]
 
 
 # ---------------- commands ----------------
@@ -1225,7 +1258,7 @@ def cmd_classroom(a):
     z = Zju()
     if a.action == "search":
         for c in z.classroom_search(a.arg or "", a.teacher or ""):
-            print(f"{c.get('course_id')}\t{c.get('title')}\t{c.get('realname')}")
+            print(f"{c.get('course_id')}\t{c.get('title')}\t{c.get('realname')}\t{c.get('term_name', '')}")
     elif a.action == "subs":
         if not a.arg:
             raise ZjuError("用法：classroom subs <course_id>")
@@ -1233,10 +1266,27 @@ def cmd_classroom(a):
             print(f"{s['sub_id']}\t{s['sub_name']}\t{s['lecturer']}")
     elif a.action == "day":
         start = dt.date.fromisoformat(a.arg) if a.arg else dt.date.today()
-        for i in range(a.days or 1):
-            d = start - dt.timedelta(days=i)
-            for s in z.day_subs(d):
-                print(f"{d}\t{s['course_id']}\t{s['sub_id']}\t{s['course_name']}\t{s['sub_name']}\t{s['lecturer']}")
+        for d, s in range_subs(z, start, a.days or 1):
+            print(f"{d}\t{s['course_id']}\t{s['sub_id']}\t{s['course_name']}\t{s['sub_name']}\t{s['lecturer']}")
+    elif a.action in ("add", "rm"):
+        ids = [a.arg, *a.more] if a.arg else []
+        if not ids or not all(v.isdigit() for v in ids):
+            raise ZjuError(f"用法：classroom {a.action} <course_id>...（course_id 用 classroom search 查）")
+        cfg = load_config()
+        tracked = cfg.setdefault("tracked_courses", {})
+        for cid in ids:
+            if a.action == "rm":
+                name = tracked.pop(cid, None)
+                print(f"[移除] {cid} {name}" if name else f"[未追蹤] {cid}")
+                continue
+            subs = z.course_subs(int(cid))  # 順便驗證 id 存在
+            name = f"{subs[0]['course_name']} {subs[0]['lecturer']}" if subs else cid
+            tracked[cid] = name
+            print(f"[追蹤] {cid} {name}（{len(subs)} 堂）")
+        save_config(cfg)
+    elif a.action == "tracked":
+        for cid, name in tracked_courses().items():
+            print(f"{cid}\t{name}")
 
 
 def cmd_ppt(a):
@@ -1401,9 +1451,10 @@ def main():
     x.add_argument("-y", "--yes", action="store_true", help="不確認直接送出")
     x.set_defaults(fn=cmd_submit)
 
-    x = sp.add_parser("classroom", help="智雲課堂：search / subs / day")
-    x.add_argument("action", choices=["search", "subs", "day"])
+    x = sp.add_parser("classroom", help="智雲課堂：search / subs / day / add / rm / tracked")
+    x.add_argument("action", choices=["search", "subs", "day", "add", "rm", "tracked"])
     x.add_argument("arg", nargs="?")
+    x.add_argument("more", nargs="*", help=argparse.SUPPRESS)
     x.add_argument("--teacher")
     x.add_argument("--days", type=int)
     x.set_defaults(fn=cmd_classroom)
@@ -1412,7 +1463,7 @@ def main():
         x = sp.add_parser(name, help="智雲 PPT → PDF" if name == "ppt" else "智雲課堂語音轉錄")
         x.add_argument("--course", type=int, help="智雲課堂 course_id（classroom search 查）")
         x.add_argument("--sub", type=int, nargs="*", help="只抓這些 sub_id")
-        x.add_argument("--days", type=int, help="不給 --course 時：最近 N 天的課（預設 1 = 今天）")
+        x.add_argument("--days", type=int, help="不給 --course 時：最近 N 天的課（預設 1 = 今天；含 classroom add 追蹤的課）")
         x.add_argument("--force", action="store_true", help="已存在也重抓")
         if name == "ppt":
             x.add_argument("--keep-images", action="store_true")
