@@ -15,7 +15,7 @@
 | `zju sync [课程...]` | 增量同步课件到 `<输出目录>/<课程>/` |
 | `zju todo` | 待办事项，依截止时间排序（本地时区） |
 | `zju activities [课程…] [--type forum homework …]` | 列出所有活动（课件、视频、作业、讨论、网页、链接、测验），附状态与截止时间 |
-| `zju show <活动id>` | 活动详情：说明、附件、完成条件；作业显示自己的提交状态，讨论显示帖数 |
+| `zju show <活动id> [--read]` | 活动详情：说明、附件、完成条件；作业显示自己的提交状态，讨论显示帖数；`--read` 下载附件并打印文字（docx/pptx/pdf/doc，贴图标成 [图]） |
 | `zju forum list <讨论id> [--mine] [--full]` / `forum read <topic>` | 列出讨论帖／读帖与回复 |
 | `zju forum post <讨论id> --title … --body …` / `forum reply <topic> --body …` | 发帖／回帖，可 `--body-file`、`--attach` 附件 |
 | `zju upload 文件…` | 上传文件到学在浙大，输出 upload id |

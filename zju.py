@@ -16,7 +16,7 @@ API 邏輯移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py sync [課程...] [--dry-run]     # 增量同步課程附件（含排程中的活動）
   zju.py todo                          # 待辦
   zju.py activities [課程...] [--type forum homework ...]  # 所有活動（含測驗）
-  zju.py show <活動id>                  # 活動詳情；作業顯示自己的提交狀態
+  zju.py show <活動id> [--read]         # 活動詳情；作業顯示自己的提交狀態；--read 印出附件文字
   zju.py forum list|read|post|reply ... # 討論區
   zju.py upload 檔案...                 # 上傳，印 upload id
   zju.py submit <作業id> --file ... [--body ...] [--draft] [-y]  # 交作業
@@ -725,6 +725,48 @@ def html_to_text(s: str | None) -> str:
     return re.sub(r"\n{3,}", "\n\n", s).strip()
 
 
+def doc_to_text(data: bytes) -> str | None:
+    """附件位元組 → 純文字；依檔頭判格式（預覽來源可能把 docx 換成 PDF）。不支援回 None。"""
+    if data[:4] == b"PK\x03\x04":
+        import zipfile, io
+        z = zipfile.ZipFile(io.BytesIO(data))
+        names = z.namelist()
+        if "word/document.xml" in names:
+            parts = ["word/document.xml"]
+            para, tag = r"</w:p>", r"<(?:w|m):t[^>]*>([^<]*)</(?:w|m):t>"  # m:t = 公式裡的字
+        else:
+            parts = sorted((n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+                           key=lambda n: int(re.search(r"\d+", n.rsplit("/", 1)[1]).group()))
+            para, tag = r"</a:p>", r"<a:t>([^<]*)</a:t>"
+        if not parts:
+            return None
+        out = []
+        for i, n in enumerate(parts):
+            xml = z.read(n).decode("utf-8", "replace")
+            lines = ["".join(re.findall(tag, p_)) + " [圖]" * len(re.findall(r"<w:drawing>|<w:pict>", p_))
+                     for p_ in re.split(para, xml)]  # 公式常是貼圖，標出來免得以為漏字
+            txt = "\n".join(l for l in lines if l.strip())
+            out.append(f"--- 第 {i + 1} 頁 ---\n{txt}" if len(parts) > 1 else txt)
+        return html.unescape("\n".join(out)).strip()
+    tool = None
+    if data[:5] == b"%PDF-" and shutil.which("pdftotext"):
+        tool = ["pdftotext", "-layout", "{f}", "-"]
+    elif data[:4] == b"\xd0\xcf\x11\xe0" and shutil.which("textutil"):  # 舊版 .doc，macOS 內建
+        tool = ["textutil", "-convert", "txt", "-stdout", "{f}"]
+    elif data[:5] == b"%PDF-" or data[:4] == b"\xd0\xcf\x11\xe0":
+        return None
+    else:
+        try:
+            return data.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return None
+    with tempfile.NamedTemporaryFile(suffix=".bin") as f:
+        f.write(data)
+        f.flush()
+        r = subprocess.run([f.name if x == "{f}" else x for x in tool], capture_output=True)
+    return r.stdout.decode("utf-8", "replace").strip() if r.returncode == 0 else None
+
+
 def text_to_html(s: str) -> str:
     """純文字 → 段落 HTML（空行分段、單換行 <br>），網頁編輯器存的也是這種格式。"""
     paras = [p for p in re.split(r"\n\s*\n", s.strip()) if p.strip()]
@@ -1050,6 +1092,15 @@ def cmd_show(a):
         print(f"\n{desc}\n")
     for u in x.get("uploads") or []:
         print(f"附件：{u.get('name')}  (upload {u.get('id')})")
+        if a.read:
+            try:
+                r, _ = z.upload_response(u["id"], u.get("reference_id") or u["id"], x)
+                txt = doc_to_text(r.content)
+            except ZjuError as e:
+                txt = f"（{e}）"
+            print(f"\n{txt or '（這種格式讀不出文字，用 sync 下載後自己開）'}\n")
+    if x.get("uploads") and not a.read and not desc:
+        print("（說明在附件裡：加 --read 直接印出附件內容）")
     if t == "web_link" and d.get("link"):
         print(f"連結：{d['link']}")
     if t == "homework":
@@ -1301,6 +1352,7 @@ def main():
 
     x = sp.add_parser("show", help="單一活動詳情（說明、附件、作業提交狀態、討論帖數）")
     x.add_argument("activity", type=int)
+    x.add_argument("--read", action="store_true", help="下載附件並印出文字（docx/pptx/pdf/doc/txt）")
     x.set_defaults(fn=cmd_show)
 
     def body_args(x):
