@@ -23,8 +23,8 @@ API 邏輯移植自 PeiPei233/zju-learning-assistant (ZLA) 的 src-tauri/src/zju
   zju.py classroom search 關鍵字        # 智雲課堂找課（id 與學在浙大不同）
   zju.py classroom subs <cid>          # 列出每堂課
   zju.py classroom day [日期] [--days N]   # 課表的課＋追蹤中的旁聽課
-  zju.py classroom add|rm <cid>...      # 追蹤課表外的課（申請聽課核准的），--days 也會抓
-  zju.py classroom tracked             # 列出追蹤中的課
+  zju.py classroom add|rm <cid>...      # 追蹤課表外的課（申請聽課核准的），--days 也會抓；rm 課表的課 = 忽略
+  zju.py classroom tracked             # 列出追蹤中／忽略的課
   zju.py ppt --course <cid> | --days N [--dedup]  # 智雲 PPT 截圖合併 PDF
   zju.py transcript --course <cid> | --days N [--format txt|srt|md]
 """
@@ -945,12 +945,20 @@ def tracked_courses() -> dict[str, str]:
     return load_config().get("tracked_courses") or {}
 
 
+def ignored_courses() -> set[str]:
+    """config.json 的 ignored_courses：課表裡有但不想抓的課（如選聽後不聽了），--days 會跳過。"""
+    return set(load_config().get("ignored_courses") or [])
+
+
 def range_subs(z: Zju, end: dt.date, days: int) -> list[tuple[dt.date, dict]]:
     """end 往前 days 天：課表的課＋追蹤課程當天的堂次，依 sub_id 去重。"""
     out, seen = [], set()
+    ignored = ignored_courses()
     for i in range(days):
         d = end - dt.timedelta(days=i)
         for s in z.day_subs(d):
+            if str(s["course_id"]) in ignored:
+                continue
             if s["sub_id"] not in seen:
                 seen.add(s["sub_id"])
                 out.append((d, s))
@@ -1309,11 +1317,21 @@ def cmd_classroom(a):
             raise ZjuError(f"用法：classroom {a.action} <course_id>...（course_id 用 classroom search 查）")
         cfg = load_config()
         tracked = cfg.setdefault("tracked_courses", {})
+        ignored = cfg.setdefault("ignored_courses", [])
         for cid in ids:
             if a.action == "rm":
                 name = tracked.pop(cid, None)
-                print(f"[移除] {cid} {name}" if name else f"[未追蹤] {cid}")
+                if name:
+                    print(f"[移除] {cid} {name}")
+                elif cid not in ignored:  # 不是 add 加的 → 課表本身的課，記進忽略名單
+                    ignored.append(cid)
+                    print(f"[忽略] {cid}（課表的課，之後 --days 跳過；classroom add 可恢復）")
+                else:
+                    print(f"[已忽略] {cid}")
                 continue
+            if cid in ignored:
+                ignored.remove(cid)
+                print(f"[取消忽略] {cid}")
             subs = z.course_subs(int(cid))  # 順便驗證 id 存在
             name = f"{subs[0]['course_name']} {subs[0]['lecturer']}" if subs else cid
             tracked[cid] = name
@@ -1322,6 +1340,8 @@ def cmd_classroom(a):
     elif a.action == "tracked":
         for cid, name in tracked_courses().items():
             print(f"{cid}\t{name}")
+        for cid in sorted(ignored_courses()):
+            print(f"{cid}\t(忽略)")
 
 
 def cmd_ppt(a):
