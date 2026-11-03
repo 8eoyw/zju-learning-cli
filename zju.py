@@ -618,7 +618,8 @@ class Zju:
             for c in d.get("course", []):
                 subs.append({"course_id": int(c["id"]), "course_name": c["title"], "sub_id": int(c["sub_id"]),
                              "sub_name": c["sub_title"], "lecturer": c.get("realname", ""),
-                             "begin": int(c.get("course_begin") or 0), "over": int(c.get("course_over") or 0)})
+                             "begin": int(c.get("course_begin") or 0), "over": int(c.get("course_over") or 0),
+                             "room": c.get("room_name") or ""})
         return subs
 
     def ppt_urls(self, course_id: int, sub_id: int) -> list[str]:
@@ -1343,7 +1344,7 @@ def cmd_classroom(a):
         start = dt.date.fromisoformat(a.arg) if a.arg else today_cst()
         for d, s in range_subs(z, start, a.days or 1):
             print(f"{d}\t{s['course_id']}\t{s['sub_id']}\t{s['course_name']}\t{s['sub_name']}\t{s['lecturer']}"
-                  f"\t{class_span(s)}")
+                  f"\t{class_span(s)}\t{s.get('room') or '-'}")
     elif a.action in ("add", "rm"):
         ids = [a.arg, *a.more] if a.arg else []
         if not ids or not all(v.isdigit() for v in ids):
