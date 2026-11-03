@@ -1386,9 +1386,9 @@ def today_subs(z: Zju) -> list[dict]:
             return cache["subs"]
     except (OSError, ValueError, KeyError):
         pass
-    subs = [s for _, s in range_subs(z, today_cst(), 1)]  # 含追蹤的旁聽課、跳過忽略的課
+    subs = z.day_subs(today_cst())  # 只看課表的課：旁聽課不點名
     state_dir()
-    SCHEDULE_FILE.write_text(json.dumps({"day": today, "subs": subs}, ensure_ascii=False, default=str))
+    SCHEDULE_FILE.write_text(json.dumps({"day": today, "subs": subs}, ensure_ascii=False))
     return subs
 
 
