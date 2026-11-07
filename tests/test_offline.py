@@ -2,6 +2,8 @@
 import importlib.util
 import tempfile
 import unittest
+
+import requests
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -273,6 +275,74 @@ class Offline(unittest.TestCase):
     def test_today_cst(self):
         import datetime as dt
         self.assertEqual(zju.today_cst(), dt.datetime.now(zju.CST).date())
+
+    def test_zdbk_grade_rules(self):
+        row = lambda cj, xf, jd, kc="X": {"xkkh": f"(2025-2026-1)-{kc}-0001-1", "kcmc": kc, "cj": cj, "xf": xf, "jd": jd}
+        cs = [zju.grade_row(r) for r in (row("90", "2", "4.5"), row("不及格", "4", "0", "Y"), row("弃修", "3", "0", "Z"),
+                                         row("合格", "1.5", "3", "W"), row("中", "1", "2.4", "V"))]
+        self.assertEqual([c["in_gpa"] for c in cs], [True, True, False, False, True])
+        self.assertEqual((cs[0]["year"], cs[0]["term"], cs[0]["code"]), ("2025-2026", "1", "X"))
+        self.assertEqual(zju.gpa_of(cs), (round((2 * 4.5 + 1 * 2.4) / 7, 3), 7.0))
+        self.assertEqual([zju.passed(c) for c in cs], [True, False, False, True, True])
+
+    def test_zdbk_retaken_and_makeup(self):
+        rows = [{"xkkh": "(2024-2025-2)-M1-0001-2", "kcmc": "M", "cj": "55", "xf": "2", "jd": "0.0"},
+                {"xkkh": "(2025-2026-1)-M1", "kcmc": "M", "cj": "不及格", "xf": "2", "jd": "0.0"},
+                {"xkkh": "(2025-2026-2)-M1-0002-2", "kcmc": "M", "cj": "72", "xf": "2", "jd": "2.7"},
+                {"xkkh": "(2025-2026-2)-E1-0003-1", "kcmc": "E", "cj": "不及格", "xf": "4", "jd": "0.0"}]
+        cs = zju.mark_retaken([zju.grade_row(r) for r in rows])
+        self.assertEqual(cs[1]["remark"], "補考")
+        self.assertEqual((cs[1]["year"], cs[1]["code"]), ("2025-2026", "M1"))
+        self.assertEqual([c["retaken"] for c in cs], [True, True, False, False])  # 還沒重修的掛科照算 0
+        self.assertEqual(zju.gpa_view(cs, "abroad", "5"), (round(2 * 2.7 / 6, 3), 6.0))
+        self.assertEqual(zju.gpa_view(cs, "domestic", "5"), (round(2 * 2.7 / 10, 3), 10.0))
+
+    def test_zdbk_43_scale(self):
+        # 《浙江大学本科课程成绩评定与管理办法》：86 分以上才不同，3.9 以下兩制相同
+        self.assertEqual([zju.to_43(p) for p in (5.0, 4.8, 4.5, 4.2, 3.9, 1.5, 0.0, None)],
+                         [4.3, 4.2, 4.1, 4.0, 3.9, 1.5, 0.0, None])
+        cs = [zju.grade_row({"xkkh": "(2025-2026-1)-A-1-1", "kcmc": "A", "cj": "95", "xf": "2", "jd": "5.0"}),
+              zju.grade_row({"xkkh": "(2025-2026-1)-B-1-1", "kcmc": "B", "cj": "80", "xf": "1", "jd": "3.6"})]
+        self.assertEqual(zju.gpa_view(zju.mark_retaken(cs), "abroad", "4.3"), (round((2 * 4.3 + 3.6) / 3, 3), 3.0))
+
+    def test_chalaoshi_match(self):
+        ch = zju.Chalaoshi(None)
+        ch._idx = {"colleges": {"1": "信息与电子工程学院", "2": "数学科学学院"},
+                   "teachers": [{"id": 1, "name": "张三", "xy": 1, "rate": "9.1"}, {"id": 2, "name": "张三", "xy": 2, "rate": "3.0"},
+                                {"id": 3, "name": "JOHNSMITH", "xy": 1, "rate": "N/A"}, {"id": 4, "name": "李四", "xy": 1, "rate": "8.0"}]}
+        ch._gpa["电路"] = {"李四": {"gpa": 3.5, "sd": 1.0, "n": "50+"}}
+        ts = ch.teachers({"jsxm": "张三<br>JOHN SMITH<br>李四/[极限飞盘]<br>王五"}, "电路", "信息与电子工程学院")
+        self.assertEqual([t.get("url", "").split("/")[-2:-1] for t in ts[:3]], [["1"], ["3"], ["4"]])
+        self.assertIsNone(ts[1]["rate"])
+        self.assertEqual(zju.teacher_label(ts[2]), "李四 8.0分 均績3.5±1（50+人）")
+        self.assertEqual(zju.teacher_label(ts[3]), "王五（查老師無資料）")
+        self.assertEqual(ch.teachers({"jsxm": "张三"})[0]["same_name"], 2)  # 沒給學院分不出同名
+        self.assertEqual(zju.pending_label({"rs": "10/60", "yxrs": "3~25"}), "餘量/容量 10/60｜待定 本專業 3／全部 25（2.50 進 1）")
+        self.assertEqual(zju.pending_label({"rs": "-4/60", "yxrs": "0~0"}), "餘量/容量 -4/60｜待定 本專業 0／全部 0（已滿）")
+
+    def test_zdbk_expired(self):
+        def resp(code, loc="", ctype="text/html", body=""):
+            r = requests.Response()
+            r.status_code, r._content = code, body.encode()
+            r.headers.update({"Location": loc, "Content-Type": ctype} if loc else {"Content-Type": ctype})
+            return r
+        self.assertTrue(zju.Zdbk.expired(resp(901)))
+        self.assertTrue(zju.Zdbk.expired(resp(302, "https://zdbk.zju.edu.cn/jwglxt/xtgl/login_slogin.html")))
+        self.assertFalse(zju.Zdbk.expired(resp(302, "https://zdbk.zju.edu.cn/jwglxt/xtgl/login_ssologin.html?ticket=ST-1")))
+        self.assertTrue(zju.Zdbk.expired(resp(200, body='<form id="loginForm">')))
+        self.assertFalse(zju.Zdbk.expired(resp(200, ctype="application/pdf", body='id="loginForm"')))
+
+    def test_zdbk_xk_context(self):
+        page = ('<input id="xn" value="2026-2027"><input id="xq" value="2"><input id="nj" value="2023">'
+                '<input id="zydm" value="0801"><input id="xkzys" value="3"><!-- <input id="xn" value="1999-2000"> -->'
+                '<li><a onclick="categroyClick(this,\'xk_1\',\'bl\')">本类(专业)</a></li>')
+        zb = zju.Zdbk.__new__(zju.Zdbk)
+        zb._ctx = None
+        zb.req = lambda *a, **kw: type("R", (), {"text": page})()
+        c = zb.xk_context()
+        self.assertEqual((c["xnxq"], c["jxjhh"], c["xkzys"]), ("(2026-2027-2)-", "20230801", "3"))
+        self.assertEqual(c["categories"], [{"dl": "xk_1", "lx": "bl", "name": "本类(专业)"}])
+        self.assertEqual(zju.xk_credit({"kcxx": "1~4.0~3.5-1.0"}), "4.0")
 
 if __name__ == "__main__":
     unittest.main()

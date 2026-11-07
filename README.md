@@ -6,6 +6,8 @@
 
 它是 [PeiPei233/zju-learning-assistant](https://github.com/PeiPei233/zju-learning-assistant)（ZLA）的 CLI 移植版。ZLA 是很好用的桌面 GUI，但没办法写进脚本、定时任务或让 AI agent 调用；这个项目把它的 API 逻辑改写成一个 Python 文件，补上增量同步、并行下载、PPT 去重，也修了几个上游的边界状况。
 
+- [Celechron](https://github.com/Celechron/Celechron)、[Anchorite-no/zju-skill-public](https://github.com/Anchorite-no/zju-skill-public)（GPL-3.0）：`zdbk` 的 CAS 换会话、成绩、培养方案与选课端点参考它们整理的协议，代码自行以 Python 实现，没有复制。
+- [ADSR1042/Lazuli](https://github.com/ADSR1042/Lazuli)：教学班老师对应查老师评分的做法（`search.json` 索引、按 `<br>` 拆老师姓名完全比对）与「N 进 1」参考这个 zdbk 选课插件。
 ## 功能
 
 | 指令 | 作用 |
@@ -27,6 +29,11 @@
 | `zju classroom tracked` | 列出追踪中与忽略的课 |
 | `zju ppt --course <id> \| --days N [--dedup]` | 智云 PPT 截图 → `<课程>/智云PPT/<堂>.pdf` |
 | `zju transcript --course <id> \| --days N` | 语音转录 → `<课程>/转录/<堂>.txt\|srt\|md` |
+| `zju zdbk grades [--scope abroad\|domestic] [--scale 5\|4.3] [--term 2025-2026-1]` | 本科教务网（zdbk）全部成绩、各学期与总 GPA、主修 GPA、已获学分，最后附四种口径对照。`--scope abroad`（默认）：挂科后重修过的只算重修那次；`domestic`：浙大发本〔2022〕24号，重修每次都计入。`--scale 4.3`（默认，2022 级起出国用，换算按《浙江大学本科课程成绩评定与管理办法》）或 `5`。补考记录另外标示；本学期没评教会提示 |
+| `zju zdbk plan [--major 名称 --year 2024] [--list --college 学院] [--text]` | 培养方案：专业、学分、学位、核心课，完整 PDF 存到 `<输出目录>/zdbk/` |
+| `zju zdbk xk context\|selected\|credits` | 自主选课：选课学期与页签／已选志愿（已选上、待筛选、志愿顺序，附老师的查老师评分，`--gpa` 加查均绩）／选课学分 |
+| `zju zdbk xk search\|sections 关键字 [--field kcdm\|jsxm…] [--available] [--teacher 教师]` | 搜课／列教学班：时间、地点、考试时间、余量／容量、待定人数与「N 进 1」；每位老师附[查老师](https://chalaoshi.de)评分与这门课的均绩（查老师在墙外，要有代理；连不上只警告） |
+| `zju zdbk xk select\|drop <教学班号> [--yes]`、`xk reorder <班号>…` | 选课、退选、排志愿；默认送出前确认，只送一次并回查已选志愿，结果不明不自动重送（记录在 `~/.config/zju-learning/zdbk_xk_journal.jsonl`） |
 
 ## 安装
 
@@ -57,6 +64,12 @@ zju sync -j 8                      # 并行数（默认 4）
 zju classroom day --days 7
 zju ppt --days 1 --dedup           # 今天所有课的 PPT，重复截图只留最完整的一张
 zju transcript --days 1 --format md
+
+zju zdbk grades --term 2025-2026   # 某学年成绩与 GPA（默认出国口径、4.3 分制）
+zju zdbk grades --scope domestic --scale 5
+zju zdbk plan --text               # 本人培养方案，打印 PDF 全文
+zju zdbk xk sections 信号与系统 --available
+zju zdbk xk select "(2026-2027-2)-XXXX-0000000-1"
 ```
 
 输出目录的优先级：`--out` > 环境变量 `ZJU_OUT` > `~/.config/zju-learning/config.json` 的 `"out"` > `~/ZJU-Courses`。

@@ -46,7 +46,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import ssl
 
@@ -657,6 +657,415 @@ class Zju:
             raise ZjuError(f"取轉錄失敗 code={j.get('code')} {j.get('msg', '')}")
         lst = j.get("list") or []
         return lst[0].get("all_content", []) if lst else []
+
+
+# ---------------- zdbk：本科教學管理信息服務平台（正方 jwglxt） ----------------
+# 協議參考 Celechron（lib/http/zjuServices/zdbk.dart）與 Anchorite-no/zju-skill-public（lib/zdbk），自行實作。
+
+ZDBK = "https://zdbk.zju.edu.cn/jwglxt"
+ZDBK_CAS = "https://zjuam.zju.edu.cn/cas/login?service=" + quote(f"{ZDBK}/xtgl/login_ssologin.html", safe="")
+ZDBK_JOURNAL = STATE_DIR / "zdbk_xk_journal.jsonl"  # 選退課寫入前後各記一筆，結果不明時拿來對帳
+GNMKDM = {"grades": "N5083", "major": "N908550", "plan": "N153020", "xk": "N253530"}  # URL 的功能模組碼
+ZDBK_TERMS = {"1": "秋冬", "2": "春夏"}
+GRADE_PASS = re.compile(r"^(优秀?|良好?|中等?|及格|合格|[ABCDP])$")  # 五級制教務網常只寫一個字
+
+
+def zdbk_text(v) -> str:
+    return re.sub(r"\s+", " ", html_to_text(str(v or ""))).strip()
+
+
+class Zdbk:
+    """借 Zju 的 CAS cookie 換教務網 JSESSIONID（存進同一份 cookies.json），失效自動重登一次。
+    教務網按滑動窗口限頻（HTTP 921），請求間至少隔 1 秒。"""
+    GAP = 1.0
+
+    def __init__(self, z: Zju | None = None):
+        self.z = z or Zju()
+        self.su = os.environ.get("ZJU_USER") or load_config().get("username")
+        if not self.su:
+            raise ZjuError("尚未設定帳號，先跑：zju.py login")
+        self._last = 0.0
+        self._ctx = None
+
+    @staticmethod
+    def expired(r: requests.Response) -> bool:
+        if r.status_code in (901, 922):  # 901 會話失效；922 被別台機器登入頂掉
+            return True
+        loc = r.headers.get("Location", "")
+        if r.is_redirect and re.search(r"login_slogin|login_ssologin|/cas/login", loc) and "ticket=" not in loc:
+            return True
+        return (r.status_code == 200 and "html" in r.headers.get("Content-Type", "")
+                and re.search(r'id=["\']loginForm["\']', r.text) is not None)
+
+    def login(self):
+        """手動跟轉址：CAS 偶爾回 http:// 網址，http 走 NoCookieHTTP 不帶 cookie，要先升 https。"""
+        for attempt in range(2):
+            url = ZDBK_CAS
+            for _ in range(8):
+                r = self.z.get(url, allow_redirects=False)
+                if not r.is_redirect:
+                    break
+                url = urljoin(url, r.headers["Location"])
+                if url.startswith("http://"):
+                    url = "https://" + url[7:]
+            host = urlparse(url).hostname or ""
+            if host.startswith("zdbk") and r.status_code == 200 and not self.expired(r):
+                self.z.save_cookies()
+                return
+            if attempt == 0:
+                if host.startswith("zjuam"):  # CAS 自己也過期：整套重登
+                    self.z.login(*get_credentials())
+                else:
+                    time.sleep(1.5)  # 回跳偶爾落回登入頁，隔一下再走一次
+        raise ZjuError("教務網登入失敗：CAS 回跳後仍是登入頁")
+
+    def req(self, method: str, path: str, module: str, write: bool = False, **kw) -> requests.Response:
+        """write=True：不重試、會話失效也不重送（選課寫入結果不明時只能回查）。"""
+        params = {**(kw.pop("params", None) or {}), "gnmkdm": module}
+        if module != "index":
+            params["su"] = self.su
+        if method == "POST":
+            kw.setdefault("headers", {})["X-Requested-With"] = "XMLHttpRequest"
+        for attempt in range(4):
+            time.sleep(max(0.0, self._last + self.GAP - time.time()))
+            r = self.z.req(method, f"{ZDBK}/{path}", params=params, allow_redirects=False,
+                           retry=False if write else None, **kw)
+            self._last = time.time()
+            if r.status_code == 921 and not write and attempt < 3:  # 限頻：退讓後重試
+                time.sleep(3 * (attempt + 1))
+                continue
+            if self.expired(r):
+                if write:
+                    raise ZjuError("教務網會話失效，寫入請求沒有重送；先跑 zju zdbk xk selected 回查")
+                if attempt > 1:
+                    break
+                self.login()
+                continue
+            if r.status_code != 200:
+                raise ZjuError(f"教務網 HTTP {r.status_code}：{path}")
+            return r
+        raise ZjuError(f"教務網請求失敗（會話或限頻）：{path}")
+
+    def post_json(self, path: str, module: str, data: dict | None = None, **kw):
+        r = self.req("POST", path, module, data=data or {}, **kw)
+        try:
+            return r.json()
+        except ValueError:
+            raise ZjuError(f"教務網沒有回 JSON：{path}\n{r.text[:200]}")
+
+    def grid(self, path: str, module: str, form: dict, sort: str = "") -> list[dict]:
+        """jqGrid 列表：POST ?doType=query，分頁取完。"""
+        out = []
+        for page in range(1, 51):
+            j = self.post_json(path, module, {**form, "queryModel.showCount": "500", "queryModel.currentPage": str(page),
+                                              "queryModel.sortName": sort, "queryModel.sortOrder": "asc", "time": "1"},
+                               params={"doType": "query"})
+            items = j.get("items")
+            if not isinstance(items, list):
+                raise ZjuError(f"教務網列表缺 items：{path}")
+            out += items
+            total = int(j.get("totalResult") or len(out))
+            if len(out) >= total or not items:
+                return out
+        raise ZjuError(f"教務網列表分頁超過上限：{path}")
+
+    # ---- 成績 ----
+
+    def grades(self) -> dict:
+        rows = self.grid("cxdy/xscjcx_cxXscjIndex.html", GNMKDM["grades"], {"xn": "", "xq": "", "zscjl": "", "zscjr": ""}, "xkkh")
+        major = self.grid("zycjtj/xszgkc_cxXsZgkcIndex.html", GNMKDM["major"], {"xh": "", "kcmc": ""}, "xkkh, kcdm")
+        try:  # result != "1"：本學期還沒評教，教務網不給看本學期成績
+            ev = self.post_json("xtgl/index_cxMyCosJxpj.html", "index")
+            pending = ev.get("status") == "success" and ev.get("result") != "1"
+        except ZjuError:
+            pending = False
+        courses = mark_retaken([grade_row(r) for r in rows])
+        return {"courses": courses,
+                "major": mark_retaken([grade_row(r) for r in major if zdbk_text(r.get("xdbj")) == "1"]),
+                "evaluation_pending": pending}
+
+    # ---- 培養方案 ----
+
+    def plans(self, year: str = "", keyword: str = "") -> list[dict]:
+        return self.grid("pyfagl/pyfaxxcx_cxPyfaxscxIndex.html", GNMKDM["plan"],
+                         {"synj": year, "xydm": "", "gjzydm": "", "zydm": "", "dlbs": "", "jxjhh": keyword}, "synj desc, xymc, jxjhh")
+
+    def plan_pdf(self, plan_id: str) -> bytes:
+        r = self.req("GET", "pyfagl/pyfayl_cxPyfaylPdf.html", GNMKDM["plan"], params={"id": plan_id, "doType": "query"})
+        if not r.content.startswith(b"%PDF-"):
+            raise ZjuError(f"培養方案 {plan_id} 沒有回 PDF（{r.headers.get('Content-Type')}）")
+        return r.content
+
+    # ---- 選課（自主選課 xsxk，常規選課與低定共用） ----
+
+    def xk_url(self, name: str) -> str:
+        return f"xsxk/zzxkghb_{name}.html"
+
+    def xk_context(self, fresh: bool = False) -> dict:
+        """選課首頁的隱藏欄位：選課學年學期、年級、專業、志願數；頁籤（課程類別）從 categroyClick(...) 抓。"""
+        if self._ctx and not fresh:
+            return self._ctx
+        page = re.sub(r"<!--.*?-->", "", self.req("GET", self.xk_url("cxZzxkGhbIndex"), GNMKDM["xk"]).text, flags=re.S)
+        inputs = {}
+        for tag in re.findall(r"<input\b[^>]*>", page, re.I):
+            a = dict((k, html.unescape(v)) for k, _, v in re.findall(r'([\w-]+)\s*=\s*(["\'])(.*?)\2', tag, re.S))
+            if a.get("id") or a.get("name"):
+                inputs[a.get("id") or a.get("name")] = a.get("value", "")
+        if not all(inputs.get(k) for k in ("xn", "xq", "nj", "zydm", "xkzys")):
+            raise ZjuError("選課首頁缺學期／年級／專業欄位，可能目前不開放選課")
+        cats = []
+        for m in re.finditer(r"categroyClick\(\s*this\s*,\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"][^>]*>(.*?)</a>", page, re.S):
+            c = {"dl": m.group(1), "lx": m.group(2), "name": zdbk_text(m.group(3))}
+            if c not in cats:
+                cats.append(c)
+        c = {k: inputs.get(k, "") for k in ("xn", "xq", "nj", "zydm", "xkzys", "ylxs")}
+        c["xnxq"] = f"({c['xn']}-{c['xq']})-"
+        c["jxjhh"] = c["nj"] + c["zydm"]  # 本人的教學計劃號 = 年級 + 專業代碼
+        c["categories"] = cats
+        self._ctx = c
+        return c
+
+    def xk_selected(self) -> list[dict]:
+        c = self.xk_context()
+        j = self.post_json(self.xk_url("cxZzxkGhbChoosed"), GNMKDM["xk"], {"xn": c["xn"], "xq": c["xq"]})
+        if not isinstance(j, list):
+            raise ZjuError("已選志願沒有回列表")
+        return j
+
+    def xk_credits(self) -> dict:
+        self.xk_context()
+        j = self.post_json(self.xk_url("cxZzxkYxxf"), GNMKDM["xk"])
+        v = j.get("result") or {}
+        if j.get("status") != "success":
+            raise ZjuError("選課學分匯總查詢失敗")
+        return {"total": v.get("xf9"), "regular": v.get("xf91"), "short": v.get("xf92")}
+
+    def xk_search_form(self, keyword: str, field: str = "kcmc", available: bool = False) -> dict:
+        c = self.xk_context()
+        return {"xnxq": c["xnxq"], "cx_zbgx": "and", "cx_ylcx": "1" if available else "0",
+                "cxtjList[0].cxlb": field, "cxtjList[0].cxgx": "like", "cxtjList[0].cxnr": keyword}
+
+    def xk_search(self, keyword: str, field: str = "kcmc", available: bool = False, size: int = 50) -> list[dict]:
+        """全部課程搜尋（頁籤 xk_9）：回課程池列，xkkh 是課程池代號不是教學班。"""
+        j = self.post_json(self.xk_url("cxZzxkGhbDdkcList"), GNMKDM["xk"],
+                           {**self.xk_search_form(keyword, field, available), "kspage": "1", "jspage": str(size)})
+        if not isinstance(j, list):
+            raise ZjuError("課程搜尋沒有回列表")
+        return j
+
+    def xk_sections(self, course: dict, keyword: str, field: str = "kcmc") -> list[dict]:
+        """某門課（搜尋結果的一列）底下的教學班；搜尋頁籤展開時要帶原搜尋條件。"""
+        c = self.xk_context()
+        j = self.post_json(self.xk_url("cxZzxkGhbJxbList"), GNMKDM["xk"], {
+            "dl": "xk_9", "xn": c["xn"], "xq": c["xq"], "kcdm": course.get("kcdm", ""), "xkkh": course.get("xkkh", ""),
+            "ylxs": c["ylxs"], **self.xk_search_form(keyword, field)})
+        if not isinstance(j, list):
+            raise ZjuError("教學班列表沒有回列表")
+        return j
+
+    def xk_write(self, action: str, name: str, form: dict, verify) -> dict:
+        """寫入一律：先記 journal → 只送一次 → 回查已選志願判定結果。不自動重送。"""
+        def journal(stage, **kw):
+            state_dir()
+            with ZDBK_JOURNAL.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"at": dt.datetime.now(CST).isoformat(), "action": action, "stage": stage, **kw},
+                                   ensure_ascii=False) + "\n")
+        journal("before", form=form)
+        resp, err = None, None
+        try:
+            resp = self.req("POST", self.xk_url(name), GNMKDM["xk"], write=True, data=form,
+                            headers={"Referer": f"{ZDBK}/{self.xk_url('cxZzxkGhbIndex')}"}).json()
+        except (ZjuError, ValueError) as e:
+            err = str(e).splitlines()[0]
+        try:
+            after = self.xk_selected()
+        except ZjuError as e:
+            after, err = None, err or f"回查失敗：{e}"
+        ok = after is not None and verify(after)
+        rejected = isinstance(resp, dict) and str(resp.get("flag")) == "0"
+        status = "saved" if ok else "rejected" if rejected else "unknown"
+        msg = (resp or {}).get("msg", "") if isinstance(resp, dict) else ""
+        journal("after", status=status, response=resp, error=err)
+        return {"status": status, "message": msg, "error": err, "choices": after}
+
+
+def grade_row(r: dict) -> dict:
+    """一筆成績 → 是否計入績點。按浙大發本〔2022〕24號：重修每次都計入；棄修、緩考、二級制合格不計；
+    缺考、無效、不及格照教務網給的 0 績點計入。"""
+    grade, raw = zdbk_text(r.get("cj")), zdbk_text(r.get("jd"))
+    try:
+        point = float(raw)
+    except ValueError:
+        point = None
+    note = ("暫無成績" if not grade else "棄修不計" if "弃修" in grade else "緩考" if "缓考" in grade
+            else "二級制不計" if re.fullmatch(r"合格|P", grade) else "無績點" if point is None else "")
+    # 補考紀錄的選課課號只有 (學年-學期)-課程代碼，沒有教師與班號
+    m = re.match(r"\((\d{4}-\d{4})-(\d+)\)-([^-]+)(-?)", zdbk_text(r.get("xkkh")))
+    remark = "；".join(x for x in (zdbk_text(r.get("bkcj")), "補考" if m and not m.group(4) else "") if x)
+    return {"name": zdbk_text(r.get("kcmc")), "grade": grade, "credits": float(zdbk_text(r.get("xf")) or 0),
+            "point": point, "point43": to_43(point), "in_gpa": not note, "note": note, "remark": remark,
+            "year": m.group(1) if m else "", "term": m.group(2) if m else "",
+            "code": zdbk_text(r.get("kcdm")) or (m.group(3) if m else "")}
+
+
+def to_43(point: float | None) -> float | None:
+    """五分制 → 4.3 分制（《浙江大学本科课程成绩评定与管理办法》；2022 級起出國用）：
+    95–100 分 5.0→4.3、92–94 分 4.8→4.2、89–91 分 4.5→4.1、86–88 分 4.2→4.0，3.9 以下兩制相同。"""
+    return {5.0: 4.3, 4.8: 4.2, 4.5: 4.1, 4.2: 4.0}.get(point, point)
+
+
+def gpa_of(courses: list[dict], key: str = "point") -> tuple[float | None, float]:
+    counted = [c for c in courses if c["in_gpa"]]
+    cr = sum(c["credits"] for c in counted)
+    return (round(sum(c["credits"] * c[key] for c in counted) / cr, 3) if cr else None), round(cr, 2)
+
+
+def passed(c: dict) -> bool:
+    g = c["grade"]
+    return float(g) >= 60 if re.fullmatch(r"\d+(\.\d+)?", g) else bool(GRADE_PASS.match(g))
+
+
+def mark_retaken(cs: list[dict]) -> list[dict]:
+    """出國口徑：沒過（不及格、缺考、棄修…）且之後同課號有再修的，標 retaken，算 GPA 時只看重修那次。"""
+    for c in cs:
+        key, when = c["code"] or c["name"], (c["year"], c["term"])
+        c["retaken"] = not passed(c) and any((d["code"] or d["name"]) == key and (d["year"], d["term"]) > when
+                                             for d in cs)
+    return cs
+
+
+# ---------------- 查老師（chalaoshi.de） ----------------
+# 做法照 ADSR1042/Lazuli 選課插件：下載站上的 search.json 索引，教學班老師按 <br> 拆開後姓名完全比對。
+
+CHALAOSHI = "https://chalaoshi.de"
+CHALAOSHI_INDEX = STATE_DIR / "chalaoshi-index.json"
+
+
+class Chalaoshi:
+    """牆外站：Zju.req 直連失敗會退環境 proxy。索引約 1 MB、一萬多位老師，快取 7 天，過期用 ETag 條件 GET；
+    課程均績表（api 子域 /gpa?course=）每門課一次請求。連不上只警告，不擋選課查詢。"""
+    TTL = 7 * 86400
+
+    def __init__(self, z: Zju):
+        self.z = z
+        self._idx = None
+        self._names = None
+        self._gpa = {}
+        self.offline = False
+
+    def index(self) -> dict:
+        if self._idx is None:
+            self._idx = self._load()
+        return self._idx
+
+    def _load(self) -> dict:
+        cached = None
+        try:
+            cached = json.loads(CHALAOSHI_INDEX.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        if cached and time.time() - cached.get("fetched", 0) < self.TTL:
+            return cached
+        try:
+            r = self.z.get(f"{CHALAOSHI}/static/json/search.json",
+                           headers={"If-None-Match": cached["etag"]} if cached and cached.get("etag") else {})
+            if r.status_code == 304 and cached:
+                cached["fetched"] = time.time()
+            elif r.status_code == 200:
+                d = r.json()
+                cached = {"fetched": time.time(), "etag": r.headers.get("ETag", ""),
+                          "colleges": {str(c["id"]): c["name"] for c in d["colleges"]}, "teachers": d["teachers"]}
+            else:
+                raise ZjuError(f"HTTP {r.status_code}")
+        except (ZjuError, ValueError, KeyError, TypeError) as e:
+            if cached:
+                log("警告：查老師索引更新失敗，沿用舊快取")
+                return cached
+            log(f"警告：查老師連不上（牆外站，要有代理），不顯示評分：{str(e).splitlines()[0]}")
+            self.offline = True
+            return {"teachers": [], "colleges": {}}
+        state_dir()
+        CHALAOSHI_INDEX.write_text(json.dumps(cached, ensure_ascii=False), encoding="utf-8")
+        return cached
+
+    def find(self, name: str, college: str = "") -> list[dict]:
+        """姓名完全比對；同名時用開課學院挑一位，挑不出來就全回（呼叫端標同名）。"""
+        if self._names is None:  # 外籍教師教務網名字有空格、查老師沒有，比對時都去掉
+            self._names = {}
+            for t in self.index()["teachers"]:
+                self._names.setdefault(re.sub(r"\s+", "", t["name"]), []).append(t)
+        hits = self._names.get(re.sub(r"\s+", "", name), [])
+        if len(hits) > 1 and college:
+            same = [t for t in hits if self.index()["colleges"].get(str(t["xy"])) == college]
+            if len(same) == 1:
+                return same
+        return hits
+
+    def course_gpa(self, course: str) -> dict[str, dict]:
+        """某門課各老師的平均績點表：{老師: {gpa, sd, n}}；n 可能是「50+」這種字串。"""
+        if course in self._gpa or self.offline:
+            return self._gpa.get(course, {})
+        out = {}
+        try:
+            r = self.z.get("https://api.chalaoshi.de/gpa", params={"course": course})
+            if r.status_code == 200:
+                for name, gpa, sd, n in re.findall(r'<td class="course_name">([^<]*)</td>\s*<td>([\d.]+)'
+                                                   r'(?:<span[^>]*>±([\d.]+)</span>)?</td>\s*<td>([^<]*)</td>', r.text):
+                    out[html.unescape(name).strip()] = {"gpa": float(gpa), "sd": float(sd) if sd else None, "n": n.strip()}
+        except ZjuError as e:
+            log(f"警告：查老師均績表取不到（{course}）：{str(e).splitlines()[0]}")
+        self._gpa[course] = out
+        return out
+
+    def teachers(self, row: dict, course: str = "", college: str = "") -> list[dict]:
+        """教學班一列的每位老師 → 評分、評分頁、這門課的均績（有給 course 才查）。"""
+        table = self.course_gpa(course) if course else {}
+        out = []
+        # 體育課是「教師/[項目名]」
+        for name in (re.sub(r"/\[.*?\]$", "", zdbk_text(n)) for n in re.split(r"<br\s*/?>|[,，;；]", str(row.get("jsxm") or ""))):
+            if not name:
+                continue
+            hits = self.find(name, college)
+            t = {"name": name}
+            if len(hits) == 1:
+                rate = hits[0].get("rate", "")
+                t.update(rate=rate if re.fullmatch(r"\d+(\.\d+)?", rate or "") and float(rate) > 0 else None,
+                         url=f"{CHALAOSHI}/t/{hits[0]['id']}/")
+            elif hits:
+                t["same_name"] = len(hits)
+            if name in table:
+                t["course_gpa"] = table[name]
+            out.append(t)
+        return out
+
+
+def teacher_label(t: dict) -> str:
+    if "url" in t:
+        s = f"{t['name']} {t['rate']}分" if t["rate"] else f"{t['name']} 無評分"
+    elif "same_name" in t:
+        s = f"{t['name']}（查老師同名 {t['same_name']} 位）"
+    else:
+        s = f"{t['name']}（查老師無資料）"
+    if "course_gpa" in t:
+        g = t["course_gpa"]
+        sd = "" if g["sd"] is None else f"±{g['sd']:g}"
+        s += f" 均績{g['gpa']:g}{sd}（{g['n']}人）"
+    return s
+
+
+def pending_label(s: dict) -> str:
+    """rs = 餘量/容量；yxrs = 本專業待定~全部待定。全部待定 ÷ 餘量 = 幾進一（插件的「N 進 1」）。"""
+    cap, pend = zdbk_text(s.get("rs")), zdbk_text(s.get("yxrs"))
+    out = f"餘量/容量 {cap or '-'}"
+    m, p = re.match(r"(-?\d+)\s*/", cap), re.fullmatch(r"(\d+)~(\d+)", pend)
+    if p:
+        out += f"｜待定 本專業 {p.group(1)}／全部 {p.group(2)}"
+        if m:
+            rest = int(m.group(1))
+            out += "（已滿）" if rest <= 0 else f"（{int(p.group(2)) / rest:.2f} 進 1）"
+    elif pend:
+        out += f"｜待定 {pend}"
+    return out
 
 
 # ---------------- helpers ----------------
@@ -1314,20 +1723,255 @@ def cmd_submit(a):
         print(f"  文字：{comment.strip()[:80]}{'…' if len(comment.strip()) > 80 else ''}")
     if prev.get("created_at") and not prev.get("is_draft"):
         print("  注意：已經交過一次，這次會新增一份提交")
-    if not a.yes:
-        if not sys.stdin.isatty():
-            raise ZjuError("非互動環境要加 --yes 才會真的送出")
-        try:
-            ok = input("確定送出？[y/N] ").strip().lower() == "y"
-        except EOFError:  # Windows 的 NUL 也算 tty，讀不到就當取消
-            ok = False
-        if not ok:
-            log("已取消（非互動環境加 --yes）")
-            return
+    if not confirm(a.yes):
+        return
     ids = upload_all(z, a.file) + (a.upload_id or [])
     content = comment if a.html else text_to_html(comment) if comment.strip() else ""
     s = z.submit(x["id"], content, ids, a.draft, (x.get("data") or {}).get("mode") or "normal", draft_id)
     print(f"[{kind}] submission {s.get('id', '')} ✓")
+
+
+def confirm(yes: bool, question: str = "確定送出？") -> bool:
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        raise ZjuError("非互動環境要加 --yes 才會真的送出")
+    try:
+        ok = input(f"{question}[y/N] ").strip().lower() == "y"
+    except EOFError:  # Windows 的 NUL 也算 tty，讀不到就當取消
+        ok = False
+    if not ok:
+        log("已取消（非互動環境加 --yes）")
+    return ok
+
+
+def term_name(year: str, term: str) -> str:
+    return f"{year} {ZDBK_TERMS.get(term, f'第{term}學期')}"
+
+
+def cmd_zdbk(a):
+    zb = Zdbk()
+    {"grades": zdbk_grades, "plan": zdbk_plan, "xk": zdbk_xk}[a.zcmd](zb, a)
+
+
+GPA_SCOPES = {"abroad": "出國（掛科後重修過的只算重修那次）", "domestic": "國內（浙大發本〔2022〕24號，重修每次都計入）"}
+
+
+def gpa_view(cs: list[dict], scope: str, scale: str) -> tuple[float | None, float]:
+    return gpa_of([c for c in cs if scope == "domestic" or not c["retaken"]], "point43" if scale == "4.3" else "point")
+
+
+def zdbk_grades(zb: Zdbk, a):
+    g = zb.grades()
+    cs = g["courses"]
+    combos = {f"{sc}_{sl}": gpa_view(cs, sc, sl) for sc in GPA_SCOPES for sl in ("5", "4.3")}
+    if a.json:
+        g["gpa"] = {k: {"gpa": v[0], "credits": v[1]} for k, v in combos.items()}
+        print(json.dumps(g, ensure_ascii=False, indent=1))
+        return
+    key = "point43" if a.scale == "4.3" else "point"
+    print(f"口徑：{GPA_SCOPES[a.scope]}｜{a.scale} 分制（--scope abroad|domestic、--scale 5|4.3 切換）\n")
+    terms: dict[tuple[str, str], list[dict]] = {}
+    for c in cs:
+        terms.setdefault((c["year"], c["term"]), []).append(c)
+    for (year, term), lst in sorted(terms.items()):
+        if a.term and not f"{year}-{term}".startswith(a.term):
+            continue
+        gpa, cr = gpa_view(lst, a.scope, a.scale)
+        print(f"{term_name(year, term)}\tGPA {gpa if gpa is not None else '-'}（計入 {cr} 學分）")
+        for c in lst:
+            point = "-" if c[key] is None else f"{c[key]:g}"
+            dropped = "已重修，出國口徑不計" if c["retaken"] and a.scope == "abroad" else ""
+            extra = "；".join(x for x in (c["note"], c["remark"], dropped) if x)
+            print(f"  {c['grade']}\t{c['credits']:g}\t{point}\t{c['name']}{f'（{extra}）' if extra else ''}")
+    gpa, cr = combos[f"{a.scope}_{a.scale}"]
+    print(f"\n總 GPA {gpa}（計入 {cr} 學分）")
+    if g["major"]:
+        mg, mcr = gpa_view(g["major"], a.scope, a.scale)
+        print(f"主修 GPA {mg}（計入 {mcr} 學分，教務網「成績主修數據」標記已修的課）")
+    earned = {c["code"] or c["name"]: c["credits"] for c in cs if passed(c)}  # 同課重修只算一次學分
+    print(f"已獲學分 {round(sum(earned.values()), 2):g}")
+    print("四種口徑：" + "｜".join(f"{'出國' if sc == 'abroad' else '國內'} {sl} 分制 {combos[f'{sc}_{sl}'][0]}"
+                                  for sc in GPA_SCOPES for sl in ("5", "4.3")))
+    print("棄修、緩考、二級制不計；缺考、不及格以 0 計入（出國口徑下還沒重修的掛科也照算 0）。")
+    if g["evaluation_pending"]:
+        print("注意：本學期還沒完成評教，教務網暫不顯示本學期成績。")
+
+
+PLAN_FIELDS = (("zymc", "專業"), ("xymc", "學院"), ("synj", "年級"), ("dlbsmc", "類別"), ("zdbyxf", "最低畢業學分"),
+               ("syxw", "學位"), ("xz", "學制"), ("xqmc", "校區"), ("jxjhh", "教學計劃號"))
+
+
+def zdbk_plan(zb: Zdbk, a):
+    if a.list or a.major:
+        year = a.year or zb.xk_context()["nj"]
+        rows = [r for r in zb.plans(year) if (a.college or "") in zdbk_text(r.get("xymc"))
+                and (a.major or "") in zdbk_text(r.get("zymc"))]
+        if a.list or len(rows) != 1:
+            if a.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=1))
+                return
+            if not a.list:
+                log(f"「{a.major}」在 {year} 級對到 {len(rows)} 個方案，名稱寫完整一點：" if rows else f"{year} 級沒有專業名含「{a.major}」的方案")
+            for r in rows:
+                print("\t".join(zdbk_text(r.get(k)) for k in ("jxjhh", "synj", "xymc", "zymc", "dlbsmc", "zdbyxf", "syxw")))
+            return
+        plan = rows[0]
+    else:
+        c = zb.xk_context()
+        pid = (a.year or c["nj"]) + c["zydm"]
+        plan = next((r for r in zb.plans(keyword=pid) if zdbk_text(r.get("jxjhh")) == pid), None)
+        if not plan:
+            raise ZjuError(f"找不到教學計劃號 {pid} 的培養方案；用 --list 看全部")
+    if a.json:
+        print(json.dumps(plan, ensure_ascii=False, indent=1))
+        return
+    for k, label in PLAN_FIELDS:
+        print(f"{label}：{zdbk_text(plan.get(k)) or '-'}")
+    for k, label in (("zyhxkc", "專業核心課"), ("qywkc", "前沿課")):
+        items = [s.strip() for s in re.split(r"<br\s*/?>|\s{2,}", str(plan.get(k) or ""), flags=re.I) if s.strip()]
+        if items:
+            print(f"{label}：{'、'.join(html.unescape(s) for s in items)}")
+    pid = zdbk_text(plan.get("jxjhh"))
+    data = zb.plan_pdf(pid)
+    dest = Path(a.out) / "zdbk" / safe_name(f"培养方案-{zdbk_text(plan.get('synj'))}-{zdbk_text(plan.get('zymc'))}.pdf")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    print(f"完整方案 PDF（各學期課程、學分要求）：{dest}")
+    if a.text:
+        print(doc_to_text(data) or "（沒有 pdftotext，讀不出 PDF 文字）")
+
+
+def xk_row(r: dict, *keys: str) -> str:
+    return "\t".join(zdbk_text(r.get(k)) or "-" for k in keys)
+
+
+def xk_credit(r: dict) -> str:
+    """課程列沒有 xf，學分藏在 kcxx（如 1~4.0~3.5-1.0 的第二段）。"""
+    parts = zdbk_text(r.get("kcxx")).split("~")
+    return zdbk_text(r.get("xf")) or (parts[1] if len(parts) > 1 else "-")
+
+
+def xk_find_section(zb: Zdbk, xkkh: str) -> dict:
+    """教學班號 (學年-學期)-課程代碼-教師工號-序號 → 用課程代碼搜，再從教學班列表找回含 tabname 的那列。"""
+    m = re.match(r"\((\d{4}-\d{4})-(\d+)\)-([^-]+)-", xkkh)
+    c = zb.xk_context(fresh=True)
+    if not m or (m.group(1), m.group(2)) != (c["xn"], c["xq"]):
+        raise ZjuError(f"{xkkh} 不是本次選課學期（{c['xn']}-{c['xq']}）的教學班號；用 xk sections 查")
+    for course in zb.xk_search(m.group(3), field="kcdm"):
+        for s in zb.xk_sections(course, m.group(3), field="kcdm"):
+            if s.get("xkkh") == xkkh:
+                return {**course, **s}
+    raise ZjuError(f"目前的選課列表裡找不到教學班 {xkkh}")
+
+
+def zdbk_xk(zb: Zdbk, a):
+    act = a.action
+    if act == "context":
+        c = zb.xk_context()
+        print(f"選課學期：{term_name(c['xn'], c['xq'])}（{c['xn']}-{c['xq']}）｜年級 {c['nj']}｜專業代碼 {c['zydm']}"
+              f"｜每門課志願數 {c['xkzys']}")
+        print("頁籤：" + "、".join(f"{x['name']}({x['dl']})" for x in c["categories"]))
+    elif act in ("selected", "credits"):
+        if act == "selected":
+            rows = zb.xk_selected()
+            ch = Chalaoshi(zb.z)
+            for r in rows:
+                r["teachers"] = ch.teachers(r, zdbk_text(r.get("kcmc")) if a.gpa else "", zdbk_text(r.get("kkxy")))
+            if a.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=1))
+                return
+            rows.sort(key=lambda r: (zdbk_text(r.get("xkzyfz")) or zdbk_text(r.get("kcdm")), zdbk_text(r.get("xkzy"))))
+            for r in rows:
+                state = {"1": "已選上", "0": "待篩選"}.get(zdbk_text(r.get("sxbj")), "?")
+                print(f"{state}\t志願{zdbk_text(r.get('xkzy')) or '-'}\t" + xk_row(r, "xkkh", "kcmc")
+                      + "\t" + "；".join(map(teacher_label, r["teachers"])) + "\t" + xk_row(r, "sksj", "xf"))
+        cr = zb.xk_credits()
+        print(f"選課學分：合計 {cr['total']}（長學期 {cr['regular']}，短學期 {cr['short']}）")
+    elif act == "search":
+        rows = zb.xk_search(a.arg, a.field, a.available)
+        if a.json:
+            print(json.dumps(rows, ensure_ascii=False, indent=1))
+            return
+        for r in rows:
+            print(xk_row(r, "kcdm", "kcmc") + f"\t{xk_credit(r)}\t" + xk_row(r, "xxq", "kclb", "kkxy"))
+        if not rows:
+            log("沒有符合的課程")
+    elif act == "sections":
+        courses = zb.xk_search(a.arg, a.field, a.available)
+        if len(courses) > 5:
+            raise ZjuError(f"「{a.arg}」對到 {len(courses)} 門課，先用 xk search 看，再給完整課名或 --field kcdm 課程代碼")
+        out, ch = [], Chalaoshi(zb.z)
+        for course in courses:
+            secs = [s for s in zb.xk_sections(course, a.arg, a.field) if not a.teacher or a.teacher in zdbk_text(s.get("jsxm"))]
+            for s in secs:
+                s["teachers"] = ch.teachers(s, zdbk_text(course.get("kcmc")), zdbk_text(course.get("kkxy")))
+            out.append({**course, "sections": secs})
+            if a.json:
+                continue
+            print(f"{zdbk_text(course.get('kcdm'))} {zdbk_text(course.get('kcmc'))}（{xk_credit(course)} 學分，"
+                  f"{zdbk_text(course.get('xxq'))}，{zdbk_text(course.get('kkxy'))}）")
+            for s in secs:
+                print(f"  {zdbk_text(s.get('xkkh'))}　{pending_label(s)}")
+                print(f"    老師：{'；'.join(map(teacher_label, s['teachers'])) or '-'}")
+                print(f"    {xk_row(s, 'sksj')}｜{xk_row(s, 'skdd')}｜考試 {xk_row(s, 'kssj')}")
+        if a.json:
+            print(json.dumps(out, ensure_ascii=False, indent=1))
+        elif not courses:
+            log("沒有符合的課程")
+    elif act in ("select", "drop"):
+        before = zb.xk_selected()
+        mine = next((r for r in before if r.get("xkkh") == a.arg), None)
+        if act == "select":
+            if mine:
+                print(f"{a.arg} 已在志願裡，不用再選")
+                return
+            s = xk_find_section(zb, a.arg)
+            if str(s.get("jxbly")) == "2" or s.get("tabname") == "jxrwbview":
+                raise ZjuError("補考選課不走常規志願介面")
+            c = zb.xk_context()
+            print(f"選課：{xk_row(s, 'kcmc', 'xkkh', 'jsxm', 'sksj', 'skdd')}\t餘量/容量 {zdbk_text(s.get('rs')) or '-'}")
+            print("  常規選課存的是志願，截止後統一篩選；資格、時間衝突由教務網判定。")
+            form, name = {"xn": c["xn"], "xq": c["xq"], "nj": c["nj"], "xkkh": a.arg, "tabname": s.get("tabname", ""),
+                          "xkzys": c["xkzys"]}, "xkBcZyZzxkGhb"
+            verify = lambda rows: any(r.get("xkkh") == a.arg for r in rows)
+        else:
+            if not mine:
+                print(f"{a.arg} 不在志願裡，不用退")
+                return
+            print(f"退選：{xk_row(mine, 'kcmc', 'xkkh', 'jsxm', 'sksj')}")
+            if zdbk_text(mine.get("sxbj")) == "1":
+                print("  注意：這門已選上（或預置），退掉之後不保證選得回來")
+            form, name = {"xkkh": a.arg}, "tuikBcZzxkGhb"
+            verify = lambda rows: all(r.get("xkkh") != a.arg for r in rows)
+        if confirm(a.yes):
+            xk_report(zb.xk_write(act, name, form, verify))
+    elif act == "reorder":
+        ids = [a.arg, *a.more]
+        before = zb.xk_selected()
+        rows = [next((r for r in before if r.get("xkkh") == x), None) for x in ids]
+        if None in rows or len(set(ids)) != len(ids):
+            raise ZjuError("排序裡有不在志願中或重複的教學班號；先跑 xk selected")
+        group = lambda r: zdbk_text(r.get("xkzyfz")) or zdbk_text(r.get("kcdm"))
+        if len({group(r) for r in rows}) != 1 or len([r for r in before if group(r) == group(rows[0])]) != len(ids):
+            raise ZjuError("一次只能排同一志願組，而且要列出該組全部教學班")
+        for i, r in enumerate(rows, 1):
+            print(f"志願{i}：{xk_row(r, 'xkkh', 'kcmc', 'jsxm', 'sksj')}")
+        print("  注意：已選上／預置課程改順序會重新參與篩選")
+        verify = lambda cur: all(any(r.get("xkkh") == x and zdbk_text(r.get("xkzy")) == str(i) for r in cur)
+                                 for i, x in enumerate(ids, 1))
+        if confirm(a.yes):
+            xk_report(zb.xk_write("reorder", "xkBcZypxZzxkGhb",
+                                  {"xkkhs": ",".join(ids), "zypxs": ",".join(str(i) for i in range(1, len(ids) + 1))}, verify))
+
+
+def xk_report(res: dict):
+    label = {"saved": "已確認寫入（回查志願列表）", "rejected": "教務網拒絕", "unknown": "結果不明"}[res["status"]]
+    print(f"[{label}] {res['message'] or ''}".rstrip())
+    if res["error"]:
+        print(f"  {res['error']}")
+    if res["status"] != "saved":
+        raise ZjuError(f"不要直接重送：先跑 zju zdbk xk selected 回查；紀錄在 {ZDBK_JOURNAL}")
 
 
 def cmd_classroom(a):
@@ -1590,6 +2234,34 @@ def main():
     x.add_argument("--margin", type=int, default=10, metavar="MIN", help="上課前後各放寬幾分鐘（預設 10）")
     x.add_argument("--json", action="store_true")
     x.set_defaults(fn=cmd_rollcall)
+
+    x = sp.add_parser("zdbk", help="本科教學管理信息服務平台：grades / plan / xk")
+    zp = x.add_subparsers(dest="zcmd", required=True)
+    y = zp.add_parser("grades", help="全部成績、各學期與總 GPA、主修 GPA、已獲學分；出國／國內、五分／4.3 可切換")
+    y.add_argument("--scope", choices=["abroad", "domestic"], default="abroad",
+                   help="abroad：掛科後重修過的只算重修那次（預設）；domestic：校內規則，重修每次都計入")
+    y.add_argument("--scale", choices=["5", "4.3"], default="4.3", help="績點分制（預設 4.3，2022 級起出國用）")
+    y.add_argument("--term", help="只看某學年或學期，如 2025-2026 或 2025-2026-1（1 秋冬、2 春夏）")
+    y.add_argument("--json", action="store_true")
+    y = zp.add_parser("plan", help="培養方案：預設本人方案並下載完整 PDF")
+    y.add_argument("--major", help="看別的專業（名稱片段）")
+    y.add_argument("--year", help="入學年級，如 2024（預設本人年級）")
+    y.add_argument("--list", action="store_true", help="列出該年級全部方案（可配 --college/--major 篩）")
+    y.add_argument("--college", help="--list 時按學院名篩")
+    y.add_argument("--text", action="store_true", help="順便印出 PDF 文字（需要 pdftotext）")
+    y.add_argument("--json", action="store_true")
+    y = zp.add_parser("xk", help="自主選課：context / selected / credits / search / sections / select / drop / reorder")
+    y.add_argument("action", choices=["context", "selected", "credits", "search", "sections", "select", "drop", "reorder"])
+    y.add_argument("arg", nargs="?", help="search/sections：關鍵字；select/drop：教學班號；reorder：依序列出教學班號")
+    y.add_argument("more", nargs="*", help=argparse.SUPPRESS)
+    y.add_argument("--field", default="kcmc", choices=["kcmc", "kcdm", "jsxm", "kclb", "sksj", "skdd", "kkxy"],
+                   help="search/sections 搜哪個欄位（課名 kcmc、課程代碼 kcdm、教師 jsxm…，預設課名）")
+    y.add_argument("--available", action="store_true", help="只看有餘量的")
+    y.add_argument("--teacher", help="sections 只列這位教師的班")
+    y.add_argument("--gpa", action="store_true", help="selected 也查每門課各老師的查老師均績（每門課一次請求）")
+    y.add_argument("--yes", action="store_true", help="select/drop/reorder 不再詢問直接送出")
+    y.add_argument("--json", action="store_true")
+    x.set_defaults(fn=cmd_zdbk)
 
     for name, fn in (("ppt", cmd_ppt), ("transcript", cmd_transcript)):
         x = sp.add_parser(name, help="智雲 PPT → PDF" if name == "ppt" else "智雲課堂語音轉錄")
